@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "npa-ocr"
+version = "0.1.0"
+description = "OCR сканов без текстового слоя в DOCX: гибридная схема Tesseract + TATR + PaddleOCR"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pypdf>=5.0",
+    "Pillow>=10.0",
+    "python-docx>=1.1",
+    "pymupdf>=1.24",
+    "psutil>=5.9",
+    "pytesseract>=0.3.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+# Модели таблиц (TATR) и PaddleOCR — тяжёлые (torch, трансформеры, несколько ГБ
+# моделей при первом запуске). Без этого extra пакет импортируется и юнит-тесты
+# проходят (движки в тестах подменены фейками), но реальное распознавание таблиц
+# работать не будет.
+models = [
+    "paddleocr>=3.7",
+    "paddlepaddle",
+    "paddlex[ocr]",
+    "torch",
+    "transformers>=4.45,<5",
+    "timm",
+]
+
+[project.scripts]
+npa-ocr = "npa_ocr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = [
+    "live: тест против реального скана, с настоящими PaddleOCR/Tesseract (медленно, минуты на страницу)",
+]
+addopts = "-m \"not live\""
