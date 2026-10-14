@@ -25,6 +25,18 @@ pip install -e ".[models]"
 Системно нужен Tesseract с русским языком (`tesseract-ocr` + `tesseract-ocr-rus` /
 `winget install tesseract-ocr.tesseract`).
 
+Или Docker — образ собирает Tesseract и CPU-сборку torch/torchvision (несовместимость
+версий между CPU torch и torchvision из PyPI уже обойдена в Dockerfile):
+
+```bash
+docker build -t npa-ocr .
+docker run --rm -v "$PWD":/data npa-ocr /data/scan.pdf --out /data/out.docx
+```
+
+Пик памяти при реальном распознавании не измерен точно, но превышал 12 ГБ на
+реальном документе — для контейнера нужно не меньше этого, лучше с запасом
+(`docker run --memory 24g ...`).
+
 ## CLI
 
 ```bash

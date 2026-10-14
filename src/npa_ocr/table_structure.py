@@ -17,6 +17,15 @@ from npa_ocr.ocr_table import TableCell
 Box = tuple[float, float, float, float]
 
 TATR_MODEL_NAME = "microsoft/table-transformer-structure-recognition-v1.1-all"
+# Отдельная модель именно для поиска таблиц на ЦЕЛОЙ странице (detect_table_regions) —
+# не структуры уже вырезанной таблицы (TATR_MODEL_NAME, тот используется только после
+# того, как область уже найдена, см. detect_structure). Раньше detect_table_regions
+# использовал TATR_MODEL_NAME с тем же TATR_TABLE_LABEL — но эта модель обучена на
+# кропах таблиц, а не целых страницах, и на плотном выровненном по ширине тексте
+# (типичная вёрстка НПА) систематически давала ложное срабатывание: одна область на
+# всю страницу целиком. table-transformer-detection обучена на целых страницах
+# документов (PubTables-1M, detection split) — это её прямое назначение.
+TATR_DETECTION_MODEL_NAME = "microsoft/table-transformer-detection"
 TATR_TABLE_LABEL = 0
 TATR_COLUMN_LABEL = 1
 TATR_ROW_LABEL = 2
@@ -291,10 +300,24 @@ def load_tatr():
     return model, proc
 
 
-def _detect(img, labels: set[int], threshold: float) -> list[Box]:
+@lru_cache(maxsize=1)
+def load_tatr_detector():
+    """Модель для detect_table_regions — см. комментарий у TATR_DETECTION_MODEL_NAME.
+    Отдельный кэш от load_tatr(): структура и детекция на целой странице — разные
+    модели, обе могут понадобиться на одном документе (детекция находит область,
+    detect_structure затем разбирает её на строки/столбцы)."""
+    import torch  # noqa: F401 — торч первым, иначе конфликт с paddle на Windows
+    from transformers import AutoImageProcessor, TableTransformerForObjectDetection
+
+    model = TableTransformerForObjectDetection.from_pretrained(TATR_DETECTION_MODEL_NAME).eval()
+    proc = AutoImageProcessor.from_pretrained(TATR_DETECTION_MODEL_NAME)
+    return model, proc
+
+
+def _detect_with(loader, img, labels: set[int], threshold: float) -> list[Box]:
     import torch
 
-    model, proc = load_tatr()
+    model, proc = loader()
     inputs = proc(images=img, return_tensors="pt")
     with torch.no_grad():
         out = model(**inputs)
@@ -302,8 +325,12 @@ def _detect(img, labels: set[int], threshold: float) -> list[Box]:
     return [tuple(b.tolist()) for b, lab in zip(res["boxes"], res["labels"]) if int(lab) in labels]
 
 
+def _detect(img, labels: set[int], threshold: float) -> list[Box]:
+    return _detect_with(load_tatr, img, labels, threshold)
+
+
 def detect_table_regions(img) -> list[Box]:
-    return _detect(img, {TATR_TABLE_LABEL}, TATR_REGION_THRESHOLD)
+    return _detect_with(load_tatr_detector, img, {TATR_TABLE_LABEL}, TATR_REGION_THRESHOLD)
 
 
 def detect_structure(img) -> TableStructure:

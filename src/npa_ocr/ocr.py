@@ -474,6 +474,25 @@ def paddle_table_regions(page: Image.Image, predict_fn: Callable[[Path], dict]) 
     return _merge_overlapping_regions(boxes)
 
 
+def table_regions_for_page(page: Image.Image, predict_fn: Callable[[Path], dict]) -> list[Box]:
+    """Области таблиц страницы: сначала дешёвый TATR (table_structure.detect_table_regions,
+    уже загружен в памяти — см. load_tatr в ocr_document), PaddleOCR (PPStructureV3, ~11
+    тяжёлых моделей PaddleX) вызывается только если TATR нашёл хотя бы одну область-кандидат.
+
+    До этого PaddleOCR стоял первым (`paddle_table_regions(...) or detect_table_regions(...)`),
+    поэтому даже страница без единой таблицы платила полную загрузку PPStructureV3 — на
+    машине с 16 ГБ RAM (а тем более в контейнере с меньшим лимитом) это надёжно приводило
+    к OOM ещё до начала распознавания текста. TATR на страницах с несколькими таблицами
+    мёрджит их в одну область (см. paddle_table_regions) — поэтому при находке TATR всё
+    равно предпочитается более точный результат PaddleOCR, если он непустой; свой результат
+    TATR остаётся резервом, если PaddleOCR с ним не согласился (вернул пусто).
+    """
+    tatr_found = table_structure.detect_table_regions(page)
+    if not tatr_found:
+        return []
+    return paddle_table_regions(page, predict_fn) or tatr_found
+
+
 class _LazyEngine:
     """Тяжёлый движок: создаётся при первом вызове и выгружается по release().
     PPStructureV3 и PaddleOCR для ячеек вместе не помещаются в память (контейнер 12 ГБ
@@ -1208,7 +1227,7 @@ def ocr_document(
 
                     def timed_regions(img: Image.Image) -> list[Box]:
                         t0 = time.perf_counter()
-                        found = paddle_table_regions(img, text_predict_fn) or table_structure.detect_table_regions(img)
+                        found = table_regions_for_page(img, text_predict_fn)
                         regions_seconds[0] = time.perf_counter() - t0
                         return found
 

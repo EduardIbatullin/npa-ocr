@@ -111,6 +111,65 @@ def test_run_paddle_tables_real_fixture():
     assert [c.text for c in header] == ["Год", "Месяц", "Значения коэффициентов"]
 
 
+def test_table_regions_for_page_skips_paddle_when_tatr_finds_nothing(monkeypatch):
+    """Страница без таблиц не должна платить цену полной загрузки PPStructureV3
+    (~11 тяжёлых моделей PaddleX) — см. npa_ocr.ocr.table_regions_for_page.
+    Раньше PaddleOCR стоял первым в `or`, поэтому вызывался всегда; это и
+    привело к OOM на страницах без единой таблицы (найдено на реальном
+    прогоне, контейнер 12 ГБ падал ещё до начала распознавания текста)."""
+    from PIL import Image
+
+    import npa_ocr.ocr as ocr_module
+
+    monkeypatch.setattr(ocr_module.table_structure, "detect_table_regions", lambda _img: [])
+
+    def _should_not_be_called(_path):
+        raise AssertionError("PaddleOCR (PPStructureV3) не должен вызываться — TATR не нашёл таблиц")
+
+    img = Image.new("RGB", (10, 10), "white")
+    assert ocr_module.table_regions_for_page(img, _should_not_be_called) == []
+
+
+def test_table_regions_for_page_calls_paddle_when_tatr_finds_candidate(monkeypatch):
+    """Когда TATR нашёл область-кандидат, PaddleOCR всё равно вызывается (даёт
+    точные отдельные области на страницах с несколькими таблицами) — порядок
+    поменялся, но итоговое поведение на реальных страницах с таблицами нет."""
+    from PIL import Image
+
+    import npa_ocr.ocr as ocr_module
+
+    monkeypatch.setattr(
+        ocr_module.table_structure, "detect_table_regions", lambda _img: [(0.0, 0.0, 10.0, 10.0)]
+    )
+    calls = {"n": 0}
+
+    def fake_predict(_path):
+        calls["n"] += 1
+        return {"table_res_list": [{"cell_box_list": [(1, 1, 2, 2), (3, 3, 4, 4)]}]}
+
+    img = Image.new("RGB", (10, 10), "white")
+    found = ocr_module.table_regions_for_page(img, fake_predict)
+    assert calls["n"] == 1
+    assert found == [(1, 1, 4, 4)]
+
+
+def test_table_regions_for_page_falls_back_to_tatr_when_paddle_disagrees(monkeypatch):
+    """TATR нашёл кандидата, но PaddleOCR не подтвердил (вернул пусто) — область
+    TATR используется как резерв, а не отбрасывается совсем."""
+    from PIL import Image
+
+    import npa_ocr.ocr as ocr_module
+
+    tatr_box = (5.0, 5.0, 50.0, 50.0)
+    monkeypatch.setattr(ocr_module.table_structure, "detect_table_regions", lambda _img: [tatr_box])
+
+    def fake_predict_empty(_path):
+        return {"table_res_list": []}
+
+    img = Image.new("RGB", (10, 10), "white")
+    assert ocr_module.table_regions_for_page(img, fake_predict_empty) == [tatr_box]
+
+
 def test_run_tesseract_text_marks_low_confidence_and_skips_table_area():
     # Взяты реальные порядки величин confidence из эксперимента со штампом
     # (докс.stage3-plan.md): чистый текст 71-97, повреждённый печатью 0-55.
