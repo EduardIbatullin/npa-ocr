@@ -290,9 +290,23 @@ def build_cells(structure: TableStructure, texts: list[tuple[Box, str]]) -> tupl
     return cells, n_rows, n_cols
 
 
+def _disable_mkldnn_workaround() -> None:
+    """MKL-DNN (oneDNN) бэкенд torch на некоторых старых CPU без AVX2 (например,
+    Intel Xeon E5-2696 v2, Ivy Bridge, 2013 — подтверждено на реальном сервере)
+    генерирует код, падающий с SIGILL на первом же реальном forward pass модели
+    (после успешной загрузки весов). На CPU с AVX2/AVX512 эффект на точность
+    результата нулевой — отключение mkldnn не меняет, что возвращает модель,
+    только какой бэкенд считает свёртки; падение скорости не измерялось точно,
+    но лучше медленнее работающий движок, чем падающий. Тот же мотив, что уже
+    применён к PaddleOCR в ocr.py (enable_mkldnn=False)."""
+    import torch
+
+    torch.backends.mkldnn.enabled = False
+
+
 @lru_cache(maxsize=1)
 def load_tatr():
-    import torch  # noqa: F401 — торч первым, иначе конфликт с paddle на Windows
+    _disable_mkldnn_workaround()
     from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 
     model = TableTransformerForObjectDetection.from_pretrained(TATR_MODEL_NAME).eval()
@@ -306,7 +320,7 @@ def load_tatr_detector():
     Отдельный кэш от load_tatr(): структура и детекция на целой странице — разные
     модели, обе могут понадобиться на одном документе (детекция находит область,
     detect_structure затем разбирает её на строки/столбцы)."""
-    import torch  # noqa: F401 — торч первым, иначе конфликт с paddle на Windows
+    _disable_mkldnn_workaround()
     from transformers import AutoImageProcessor, TableTransformerForObjectDetection
 
     model = TableTransformerForObjectDetection.from_pretrained(TATR_DETECTION_MODEL_NAME).eval()
