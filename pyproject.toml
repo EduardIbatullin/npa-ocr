@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "httpx2",  # нужен starlette.testclient.TestClient (см. tests/unit/test_server.py)
 ]
 # Модели таблиц (TATR) и PaddleOCR — тяжёлые (torch, трансформеры, несколько ГБ
 # моделей при первом запуске). Без этого extra пакет импортируется и юнит-тесты
@@ -32,6 +33,15 @@ models = [
     "torch",
     "transformers>=4.45,<5",
     "timm",
+]
+# HTTP API (npa_ocr.server) — асинхронные задания поверх CLI, см. README, «HTTP API».
+# Отдельный extra от models: сервис запускает CLI подпроцессом (self-exec, см.
+# job_runner.py), поэтому models тоже нужен на том же образе, но сама логика
+# сервера зависит только от этого extra.
+server = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
 ]
 
 [project.scripts]

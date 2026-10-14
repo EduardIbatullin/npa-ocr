@@ -15,7 +15,17 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
     FLAGS_use_mkldnn=false \
     HF_HOME=/app/cache/huggingface \
-    PADDLE_PDX_CACHE_HOME=/app/cache/paddlex
+    PADDLE_PDX_CACHE_HOME=/app/cache/paddlex \
+    # Xet (новый бэкенд загрузки с Hugging Face) на практике давал систематические
+    # обрывы соединения на больших файлах моделей (десятки минут, повторные
+    # попытки) — classic HTTP-путь huggingface_hub надёжнее в этом окружении.
+    HF_HUB_DISABLE_XET=1 \
+    # PaddleX перед использованием даже уже закэшированных моделей по умолчанию
+    # проверяет связь с хостером моделей ("Checking connectivity to the model
+    # hosters, this may take a while") — при нестабильной сети сама эта проверка
+    # зависает на минуты, хотя скачивать ничего не нужно. Модели уже в образе
+    # (см. ниже preload_models.py) — проверка не нужна вообще.
+    PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
 
 WORKDIR /app
 
@@ -24,13 +34,22 @@ WORKDIR /app
 # не совместим с CPU-сборкой torch (ошибка "operator torchvision::nms does not exist")
 RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-# Зависимости отдельно — слой кэшируется при неизменном pyproject.toml
+# Зависимости отдельно — слой кэшируется при неизменном pyproject.toml.
+# server — HTTP API (npa_ocr.server), см. README, «HTTP API».
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir -e ".[models]"
+RUN pip install --no-cache-dir -e ".[models,server]"
 
-RUN mkdir -p cache
+# Модели качаются и кэшируются здесь, на этапе сборки, а не при первом реальном
+# запросе — см. docstring scripts/preload_models.py.
+COPY scripts ./scripts
+RUN python scripts/preload_models.py
 
-# CLI-образ, не сервер: вход — сам npa-ocr, PDF и результат передаются томом.
-# Пример: docker run --rm -v "$PWD":/data npa-ocr /data/scan.pdf --out /data/out.docx
+EXPOSE 8000
+
+# По умолчанию — CLI (см. README, «CLI»): PDF и результат передаются томом.
+#   docker run --rm -v "$PWD":/data npa-ocr /data/scan.pdf --out /data/out.docx
+# Сервер (HTTP API, см. README, «HTTP API») — тот же образ, другой вход:
+#   docker run --rm -p 8000:8000 --entrypoint uvicorn npa-ocr \
+#       npa_ocr.server:app --host 0.0.0.0 --port 8000
 ENTRYPOINT ["npa-ocr"]
