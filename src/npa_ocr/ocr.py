@@ -29,11 +29,13 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -347,6 +349,34 @@ _TABLE_CROP_PADDING = 20  # пикселей при 200 DPI — запас во�
 LOW_CONFIDENCE_THRESHOLD = 0.8  # уверенность строки PaddleOCR (0–1): ниже — выделяется в DOCX
 
 
+@lru_cache(maxsize=1)
+def _paddle_runtime_usable() -> bool:
+    """Можно ли вообще импортировать PaddlePaddle в этом окружении.
+
+    CPU-колёса paddlepaddle собраны с AVX2; на процессорах без AVX2 (например,
+    Intel Xeon E5-2696 v2 / Ivy Bridge) процесс падает с SIGILL ещё на
+    `import paddle` — это не Python-исключение, try/except его не ловит.
+    Код возврата подпроцесса -4 (= сигнал 4, SIGILL) как раз то, что видит
+    пользователь в «Распознавание завершилось с кодом -4», когда TATR нашёл
+    таблицу и пайплайн впервые тянет PPStructureV3/PaddleOCR.
+    """
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+        if "avx2" not in cpuinfo.lower():
+            return False
+    except OSError:
+        pass
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import paddle"],
+            capture_output=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def _default_cell_text_fn() -> Callable[[Path], tuple[str, float]]:
     """Распознавание одного кропа ячейки: полный OCR PaddleOCR (детекция + распознавание).
     Модель распознавания без детекции на кропах ячеек даёт мусор на числах."""
@@ -368,6 +398,55 @@ def _default_cell_text_fn() -> Callable[[Path], tuple[str, float]]:
                 result.get("rec_boxes", []), result.get("rec_texts", []), result.get("rec_scores", [])
             ):
                 items.append((tuple(float(v) for v in box), text, float(score)))
+        lines = table_structure.join_fragment_lines(items)
+        text = "\n".join(line for line, _ in lines)
+        return text, tuple(score < LOW_CONFIDENCE_THRESHOLD for _, score in lines)
+
+    return read
+
+
+def _tesseract_text_predict_fn() -> Callable[[Path], dict]:
+    """Замена PPStructureV3 для текста таблиц, когда Paddle недоступен (нет AVX2).
+
+    Возвращает JSON той же формы, что ждёт `_unique_text_blocks` (rec_boxes/rec_texts
+    внутри table_res_list), но без cell_box_list — области таблиц тогда остаются
+    за TATR (см. table_regions_for_page). Качество текста ячеек ниже, чем у Paddle,
+    зато документ доходит до конца вместо SIGILL.
+    """
+
+    def predict(image_path: Path) -> dict:
+        data = _default_image_data_fn(image_path)
+        boxes: list[list[float]] = []
+        texts: list[str] = []
+        for text, conf, left, top, width, height in zip(
+            data["text"], data["conf"], data["left"], data["top"], data["width"], data["height"]
+        ):
+            word = (text or "").strip()
+            if not word or int(conf) < 0:
+                continue
+            boxes.append([float(left), float(top), float(left + width), float(top + height)])
+            texts.append(word)
+        return {"table_res_list": [{"table_ocr_pred": {"rec_boxes": boxes, "rec_texts": texts}}]}
+
+    return predict
+
+
+def _tesseract_cell_text_fn() -> Callable[[Path], tuple[str, tuple[bool, ...]]]:
+    """Замена PaddleOCR для кропа ячейки, когда Paddle недоступен (нет AVX2)."""
+
+    def read(crop_path: Path) -> tuple[str, tuple[bool, ...]]:
+        data = _default_image_data_fn(crop_path)
+        items: list[tuple[Box, str, float]] = []
+        for text, conf, left, top, width, height in zip(
+            data["text"], data["conf"], data["left"], data["top"], data["width"], data["height"]
+        ):
+            word = (text or "").strip()
+            if not word or int(conf) < 0:
+                continue
+            # Tesseract: 0–100; к шкале PaddleOCR 0–1 для порога LOW_CONFIDENCE_THRESHOLD.
+            score = max(0.0, min(1.0, float(conf) / 100.0))
+            box = (float(left), float(top), float(left + width), float(top + height))
+            items.append((box, word, score))
         lines = table_structure.join_fragment_lines(items)
         text = "\n".join(line for line, _ in lines)
         return text, tuple(score < LOW_CONFIDENCE_THRESHOLD for _, score in lines)
@@ -486,10 +565,15 @@ def table_regions_for_page(page: Image.Image, predict_fn: Callable[[Path], dict]
     мёрджит их в одну область (см. paddle_table_regions) — поэтому при находке TATR всё
     равно предпочитается более точный результат PaddleOCR, если он непустой; свой результат
     TATR остаётся резервом, если PaddleOCR с ним не согласился (вернул пусто).
+
+    Если runtime Paddle недоступен (SIGILL на CPU без AVX2, см. `_paddle_runtime_usable`),
+    PaddleOCR не вызываем вообще — иначе подпроцесс распознавания умрёт с кодом -4.
     """
     tatr_found = table_structure.detect_table_regions(page)
     if not tatr_found:
         return []
+    if not _paddle_runtime_usable():
+        return tatr_found
     return paddle_table_regions(page, predict_fn) or tatr_found
 
 
@@ -1207,11 +1291,26 @@ def ocr_document(
             with timer.step(page_number, "загрузка моделей"):
                 if use_tatr and text_predict_fn is None:
                     # TATR грузим ДО PaddleOCR: torch должен импортироваться раньше paddle на Windows.
-                    # PaddleOCR-движки создаются лениво и работают по очереди (см. _LazyEngine)
+                    # PaddleOCR-движки создаются лениво и работают по очереди (см. _LazyEngine).
+                    # На CPU без AVX2 Paddle падает с SIGILL — тогда текст таблиц берёт Tesseract.
                     table_structure.load_tatr()
-                    text_predict_fn = _LazyEngine(_default_predict_tables_fn)
-                    cell_text_fn = _LazyEngine(_default_cell_text_fn)
+                    if _paddle_runtime_usable():
+                        text_predict_fn = _LazyEngine(_default_predict_tables_fn)
+                        cell_text_fn = _LazyEngine(_default_cell_text_fn)
+                    else:
+                        print(
+                            "PaddleOCR недоступен на этом CPU (нет AVX2 / SIGILL) — "
+                            "текст таблиц через Tesseract",
+                            file=sys.stderr,
+                        )
+                        text_predict_fn = _LazyEngine(_tesseract_text_predict_fn)
+                        cell_text_fn = _LazyEngine(_tesseract_cell_text_fn)
                 if predict_tables_fn is None and not use_tatr:
+                    if not _paddle_runtime_usable():
+                        raise RuntimeError(
+                            "PaddleOCR недоступен на этом CPU (нет AVX2 / SIGILL). "
+                            "Используйте table_engine='tatr' (значение по умолчанию)."
+                        )
                     predict_tables_fn = _default_predict_tables_fn()
                 if image_data_fn is None:
                     image_data_fn = _default_image_data_fn

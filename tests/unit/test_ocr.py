@@ -138,6 +138,7 @@ def test_table_regions_for_page_calls_paddle_when_tatr_finds_candidate(monkeypat
 
     import npa_ocr.ocr as ocr_module
 
+    monkeypatch.setattr(ocr_module, "_paddle_runtime_usable", lambda: True)
     monkeypatch.setattr(
         ocr_module.table_structure, "detect_table_regions", lambda _img: [(0.0, 0.0, 10.0, 10.0)]
     )
@@ -160,6 +161,7 @@ def test_table_regions_for_page_falls_back_to_tatr_when_paddle_disagrees(monkeyp
 
     import npa_ocr.ocr as ocr_module
 
+    monkeypatch.setattr(ocr_module, "_paddle_runtime_usable", lambda: True)
     tatr_box = (5.0, 5.0, 50.0, 50.0)
     monkeypatch.setattr(ocr_module.table_structure, "detect_table_regions", lambda _img: [tatr_box])
 
@@ -168,6 +170,23 @@ def test_table_regions_for_page_falls_back_to_tatr_when_paddle_disagrees(monkeyp
 
     img = Image.new("RGB", (10, 10), "white")
     assert ocr_module.table_regions_for_page(img, fake_predict_empty) == [tatr_box]
+
+
+def test_table_regions_for_page_skips_paddle_when_runtime_unusable(monkeypatch):
+    """На CPU без AVX2 import paddle даёт SIGILL — PaddleOCR не вызываем, берём TATR."""
+    from PIL import Image
+
+    import npa_ocr.ocr as ocr_module
+
+    tatr_box = (1.0, 2.0, 30.0, 40.0)
+    monkeypatch.setattr(ocr_module, "_paddle_runtime_usable", lambda: False)
+    monkeypatch.setattr(ocr_module.table_structure, "detect_table_regions", lambda _img: [tatr_box])
+
+    def _should_not_be_called(_path):
+        raise AssertionError("PaddleOCR не должен вызываться — runtime недоступен")
+
+    img = Image.new("RGB", (10, 10), "white")
+    assert ocr_module.table_regions_for_page(img, _should_not_be_called) == [tatr_box]
 
 
 def test_run_tesseract_text_marks_low_confidence_and_skips_table_area():
