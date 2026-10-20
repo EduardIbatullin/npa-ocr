@@ -1,11 +1,15 @@
 """Точка входа OCR → DOCX для документов без текстового слоя (этап 3).
 
 Гибридная схема движков — обоснование в docs/plan.md:
-- PaddleOCR (PPStructureV3) — только для таблиц: структура ячеек надёжна (после
-  обхода известного бага с несколькими таблицами на странице — решается раздельным
-  распознаванием каждой, см. ocr_table.py), но собственная confidence у PaddleOCR
-  ненадёжна для детекции повреждений — на реальном примере явный мусор и обрезанный
-  печатью текст получали confidence 0.9+, наравне с чистым текстом.
+- PaddleOCR (PPStructureV3) — только для структуры таблиц (строки/столбцы/объединения):
+  надёжна (после обхода известного бага с несколькими таблицами на странице — решается
+  раздельным распознаванием каждой, см. ocr_table.py), но собственная confidence у
+  PaddleOCR ненадёжна для детекции повреждений — на реальном примере явный мусор и
+  обрезанный печатью текст получали confidence 0.9+, наравне с чистым текстом.
+- RapidOCR (ONNX, eslav_PP-OCRv5) — текст внутри ячеек таблиц: та же модель
+  PaddleOCR для восточнославянских языков, просто в ONNX-рантайме вместо нативной
+  PaddlePaddle — на той же точности не падает SIGILL на CPU без AVX2 (см.
+  _default_cell_text_fn).
 - Tesseract — для всего текста вне таблиц: на чистом скане распознаёт почти идеально,
   и его confidence в среднем отделяет текст, повреждённый печатью (0–55 на одном
   реальном примере), от чистого (71–97) — но не всегда: на другом документе
@@ -346,7 +350,7 @@ def run_tesseract_text(
 _TABLE_CROP_PADDING = 20  # пикселей при 200 DPI — запас вокруг таблицы при вырезании
 
 
-LOW_CONFIDENCE_THRESHOLD = 0.8  # уверенность строки PaddleOCR (0–1): ниже — выделяется в DOCX
+LOW_CONFIDENCE_THRESHOLD = 0.8  # уверенность строки распознавания (0–1): ниже — выделяется в DOCX
 
 
 @lru_cache(maxsize=1)
@@ -358,7 +362,11 @@ def _paddle_runtime_usable() -> bool:
     `import paddle` — это не Python-исключение, try/except его не ловит.
     Код возврата подпроцесса -4 (= сигнал 4, SIGILL) как раз то, что видит
     пользователь в «Распознавание завершилось с кодом -4», когда TATR нашёл
-    таблицу и пайплайн впервые тянет PPStructureV3/PaddleOCR.
+    таблицу и пайплайн впервые тянет PPStructureV3 (структура таблиц).
+
+    Текста ячеек (`_default_cell_text_fn`) это больше не касается — он теперь на
+    RapidOCR/ONNX и падения не знает независимо от AVX2; проверка осталась только
+    для PPStructureV3 (`_default_predict_tables_fn`, уточнение регионов таблиц).
     """
     try:
         cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
@@ -377,27 +385,39 @@ def _paddle_runtime_usable() -> bool:
     return result.returncode == 0
 
 
-def _default_cell_text_fn() -> Callable[[Path], tuple[str, float]]:
-    """Распознавание одного кропа ячейки: полный OCR PaddleOCR (детекция + распознавание).
-    Модель распознавания без детекции на кропах ячеек даёт мусор на числах."""
-    from paddleocr import PaddleOCR
+def _default_cell_text_fn() -> Callable[[Path], tuple[str, tuple[bool, ...]]]:
+    """Распознавание одного кропа ячейки: RapidOCR (ONNX Runtime), модель
+    eslav_PP-OCRv5_rec_mobile — та же модель PaddleOCR для восточнославянских
+    языков (рус./укр./белор.), что и раньше вызывалась напрямую через PaddlePaddle,
+    просто в ONNX-рантайме. Переход сделан после того, как нативный
+    PaddleOCR(lang="ru") на кропах ячеек стал падать SIGILL на сервере со старым CPU
+    без AVX2 — enable_mkldnn=False не спасало, проблема не в MKL-DNN-бэкенде, а
+    глубже в самой сборке PaddlePaddle; ONNX Runtime сам адаптируется к набору
+    инструкций CPU. Точность на реальных документах проверена и совпадает с
+    PaddleOCR (см. docs/plan.md)."""
+    from rapidocr import RapidOCR
+    from rapidocr.utils.typings import LangRec, ModelType, OCRVersion
 
-    engine = PaddleOCR(
-        lang="ru",
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=True,
-        enable_mkldnn=False,
+    engine = RapidOCR(
+        params={
+            "Rec.lang_type": LangRec.ESLAV,
+            "Rec.ocr_version": OCRVersion.PPOCRV5,
+            "Rec.model_type": ModelType.MOBILE,
+        }
     )
 
     def read(crop_path: Path) -> tuple[str, tuple[bool, ...]]:
-        items: list[tuple[Box, str]] = []
-        scores: list[float] = []
-        for result in engine.predict(str(crop_path)):
-            for box, text, score in zip(
-                result.get("rec_boxes", []), result.get("rec_texts", []), result.get("rec_scores", [])
-            ):
-                items.append((tuple(float(v) for v in box), text, float(score)))
+        result = engine(str(crop_path))
+        items: list[tuple[Box, str, float]] = []
+        if result.boxes is not None:
+            for box, text, score in zip(result.boxes, result.txts, result.scores):
+                rect = (
+                    float(box[:, 0].min()),
+                    float(box[:, 1].min()),
+                    float(box[:, 0].max()),
+                    float(box[:, 1].max()),
+                )
+                items.append((rect, text, float(score)))
         lines = table_structure.join_fragment_lines(items)
         text = "\n".join(line for line, _ in lines)
         return text, tuple(score < LOW_CONFIDENCE_THRESHOLD for _, score in lines)
@@ -429,29 +449,6 @@ def _tesseract_text_predict_fn() -> Callable[[Path], dict]:
         return {"table_res_list": [{"table_ocr_pred": {"rec_boxes": boxes, "rec_texts": texts}}]}
 
     return predict
-
-
-def _tesseract_cell_text_fn() -> Callable[[Path], tuple[str, tuple[bool, ...]]]:
-    """Замена PaddleOCR для кропа ячейки, когда Paddle недоступен (нет AVX2)."""
-
-    def read(crop_path: Path) -> tuple[str, tuple[bool, ...]]:
-        data = _default_image_data_fn(crop_path)
-        items: list[tuple[Box, str, float]] = []
-        for text, conf, left, top, width, height in zip(
-            data["text"], data["conf"], data["left"], data["top"], data["width"], data["height"]
-        ):
-            word = (text or "").strip()
-            if not word or int(conf) < 0:
-                continue
-            # Tesseract: 0–100; к шкале PaddleOCR 0–1 для порога LOW_CONFIDENCE_THRESHOLD.
-            score = max(0.0, min(1.0, float(conf) / 100.0))
-            box = (float(left), float(top), float(left + width), float(top + height))
-            items.append((box, word, score))
-        lines = table_structure.join_fragment_lines(items)
-        text = "\n".join(line for line, _ in lines)
-        return text, tuple(score < LOW_CONFIDENCE_THRESHOLD for _, score in lines)
-
-    return read
 
 
 TEXT_PREDICT_MAX_SIDE = 3000  # PPStructureV3 падает (сегфолт) на кропах больше ~3900 px по стороне
@@ -578,9 +575,14 @@ def table_regions_for_page(page: Image.Image, predict_fn: Callable[[Path], dict]
 
 
 class _LazyEngine:
-    """Тяжёлый движок: создаётся при первом вызове и выгружается по release().
-    PPStructureV3 и PaddleOCR для ячеек вместе не помещаются в память (контейнер 12 ГБ
-    падал по OOM при их одновременной загрузке), поэтому они работают по очереди."""
+    """Движок создаётся при первом вызове и выгружается по release(), а не сразу при
+    старте документа — страницы с текстовым слоем (без таблиц-сканов) вообще не
+    должны платить загрузку моделей. Было особенно важно, когда и регионы таблиц
+    (PPStructureV3), и текст ячеек были на PaddleOCR — одновременно оба не
+    помещались в память (контейнер 12 ГБ падал по OOM), поэтому грузились по
+    очереди. Текст ячеек теперь на RapidOCR (лёгкий ONNX, не конфликтует по
+    памяти с PPStructureV3), но ленивая загрузка оставлена и для него — дешевле и
+    не требует разбирать, нужна ли она ещё."""
 
     def __init__(self, factory: Callable[[], Callable]) -> None:
         self._factory = factory
@@ -1291,20 +1293,20 @@ def ocr_document(
             with timer.step(page_number, "загрузка моделей"):
                 if use_tatr and text_predict_fn is None:
                     # TATR грузим ДО PaddleOCR: torch должен импортироваться раньше paddle на Windows.
-                    # PaddleOCR-движки создаются лениво и работают по очереди (см. _LazyEngine).
-                    # На CPU без AVX2 Paddle падает с SIGILL — тогда текст таблиц берёт Tesseract.
+                    # PaddleOCR-движок (уточнение регионов таблиц) создаётся лениво (см. _LazyEngine).
+                    # На CPU без AVX2 Paddle падает с SIGILL — тогда регионы таблиц берёт Tesseract;
+                    # текст ячеек (RapidOCR/ONNX) от этого не зависит — работает в любом случае.
                     table_structure.load_tatr()
+                    cell_text_fn = _LazyEngine(_default_cell_text_fn)
                     if _paddle_runtime_usable():
                         text_predict_fn = _LazyEngine(_default_predict_tables_fn)
-                        cell_text_fn = _LazyEngine(_default_cell_text_fn)
                     else:
                         print(
                             "PaddleOCR недоступен на этом CPU (нет AVX2 / SIGILL) — "
-                            "текст таблиц через Tesseract",
+                            "регионы таблиц через Tesseract",
                             file=sys.stderr,
                         )
                         text_predict_fn = _LazyEngine(_tesseract_text_predict_fn)
-                        cell_text_fn = _LazyEngine(_tesseract_cell_text_fn)
                 if predict_tables_fn is None and not use_tatr:
                     if not _paddle_runtime_usable():
                         raise RuntimeError(

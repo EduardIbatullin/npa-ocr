@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "npa-ocr"
 version = "0.1.0"
-description = "OCR сканов без текстового слоя в DOCX: гибридная схема Tesseract + TATR + PaddleOCR"
+description = "OCR сканов без текстового слоя в DOCX: гибридная схема Tesseract + TATR + PaddleOCR + RapidOCR"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -33,6 +33,8 @@ models = [
     "torch",
     "transformers>=4.45,<5",
     "timm",
+    "rapidocr>=3.10",  # текст в ячейках таблиц (_default_cell_text_fn), см. ocr.py
+    "onnxruntime",
 ]
 # HTTP API (npa_ocr.server) — асинхронные задания поверх CLI, см. README, «HTTP API».
 # Отдельный extra от models: сервис запускает CLI подпроцессом (self-exec, см.
