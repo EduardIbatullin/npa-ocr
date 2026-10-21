@@ -81,3 +81,23 @@ def test_detect_marks_crops_and_classifies_candidate(tmp_path: Path):
     w, h = seen_crops[0]
     assert w == 120  # (200+10) - (100-10)
     assert h == 65  # (145+10) - (100-10)
+
+
+def test_detect_marks_skips_candidate_when_classify_fn_raises(tmp_path: Path):
+    # Реальный случай на сервере (2026-10-21): таймаут Ollama в classify_fn
+    # ронял весь документ целиком, хотя эскалация задумана как необязательное
+    # улучшение. Ошибка классификации одного кандидата не должна мешать
+    # обработке остальной страницы — кандидат просто пропускается.
+    image_path = tmp_path / "page.png"
+    Image.new("RGB", (400, 400), "white").save(image_path)
+
+    def failing_classify(_crop_path: Path) -> tuple[str, bool]:
+        raise TimeoutError("Ollama недоступна")
+
+    boxes = [
+        (100.0, 100.0, 150.0, 120.0),
+        (155.0, 100.0, 200.0, 120.0),
+        (100.0, 125.0, 180.0, 145.0),
+    ]
+    marks = detect_marks(image_path, boxes, classify_fn=failing_classify)
+    assert marks == []

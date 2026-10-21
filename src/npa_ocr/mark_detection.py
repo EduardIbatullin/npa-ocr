@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,7 +111,16 @@ def detect_marks(
     """classify_fn(crop_path) -> (mark_type, covers_text) — в реальном
     использовании это ai_escalation.classify_mark, в тестах — фейк на
     реальных данных (не загружает модель на каждый тест, см. ocr.py для
-    аналогичного паттерна с другими движками)."""
+    аналогичного паттерна с другими движками).
+
+    Ошибка classify_fn (сеть/таймаут до Ollama) ловится широко (Exception)
+    намеренно и НЕ пробрасывается дальше — проверено на реальном сервере:
+    необработанный таймаут здесь ронял весь документ целиком (десятки
+    страниц без таблиц и штампов пропадали из-за одной недоступности
+    Ollama), хотя вся эскалация задумана как необязательное улучшение,
+    см. docs/plan.md. Кандидат с ошибкой классификации просто пропускается
+    (не считается меткой) — та же степень деградации, что и раньше (без
+    --ai-escalation)."""
     regions = cluster_candidate_regions(low_confidence_word_boxes)
     if not regions:
         return []
@@ -131,6 +141,9 @@ def detect_marks(
             tmp_path = Path(tmp.name)
         try:
             mark_type, covers_text = classify_fn(tmp_path)
+        except Exception as exc:
+            print(f"[ИИ-эскалация] классификация не удалась: {exc}", file=sys.stderr)
+            continue
         finally:
             tmp_path.unlink(missing_ok=True)
         marks.append(Mark(bbox=region, mark_type=mark_type, covers_text=covers_text))

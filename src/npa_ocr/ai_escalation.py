@@ -118,7 +118,7 @@ def _parse_classify_response(response: str) -> tuple[str, bool]:
     return mark_type, covers_text
 
 
-def classify_mark(crop_path: Path, *, timeout: float = 60.0) -> tuple[str, bool]:
+def classify_mark(crop_path: Path, *, timeout: float = 120.0) -> tuple[str, bool]:
     """Классифицирует кандидатную область (см. mark_detection.cluster_candidate_regions)
     — возвращает (mark_type, covers_text). mark_type — одно из "печать",
     "штамп_регистрации", "электронная_подпись", "не_метка".
