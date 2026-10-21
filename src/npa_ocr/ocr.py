@@ -395,9 +395,15 @@ def _apply_mark_escalation(
     low_word_boxes = [
         (x, y, x + w, y + h) for _, _, words in line_items for (y, x, _word, w, h, low) in words if low
     ]
+    print(f"[ИИ-эскалация] низкоуверенных слов на странице: {len(low_word_boxes)}", file=sys.stderr)
     if not low_word_boxes:
         return line_items
     marks = detect_marks_fn(image_path, low_word_boxes)
+    print(
+        f"[ИИ-эскалация] найдено областей: {len(marks)} — "
+        + "; ".join(f"{m.mark_type} (covers_text={m.covers_text})" for m in marks),
+        file=sys.stderr,
+    )
     if not marks:
         return line_items
 
@@ -489,11 +495,13 @@ def _recover_run(
         tmp_path = Path(tmp.name)
     try:
         text = recover_fn(tmp_path)
-    except Exception:
+    except Exception as exc:
+        print(f"[ИИ-эскалация] восстановление не удалось: {exc}", file=sys.stderr)
         return None
     finally:
         tmp_path.unlink(missing_ok=True)
     words = text.split()
+    print(f"[ИИ-эскалация] восстановлено: {' '.join(words)!r}", file=sys.stderr)
     return words or None
 
 
