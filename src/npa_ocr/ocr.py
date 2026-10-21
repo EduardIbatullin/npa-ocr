@@ -312,9 +312,10 @@ def run_tesseract_text(
     recover_covered_text_fn — результат всё равно остаётся с low=True
     (ИИ-восстановленный текст — не замена честной неуверенности слепым
     доверием, подлежит проверке человеком, как и раньше); слова внутри меток
-    типа «электронная_подпись» с covers_text=False (собственное содержимое
-    метки — не текст документа) исключаются из текста целиком, см. пример
-    Постановление №710 в docs/plan.md."""
+    типа «электронная_подпись»/«штамп_регистрации» с covers_text=False
+    (собственное содержимое метки — не текст документа, а служебная отметка)
+    исключаются из текста целиком, см. примеры (Постановление №710,
+    регистрационный штамп Минюста) в docs/plan.md."""
     data = image_data_fn(image_path)
     lines: dict[tuple[int, int, int], list[tuple[float, float, str, float, float, bool]]] = {}
     for i in range(len(data["text"])):
@@ -418,7 +419,11 @@ def _apply_mark_escalation(
     if not marks:
         return line_items
 
-    discard_bboxes = [m.bbox for m in marks if m.mark_type == "электронная_подпись" and not m.covers_text]
+    discard_bboxes = [
+        m.bbox
+        for m in marks
+        if m.mark_type in ("электронная_подпись", "штамп_регистрации") and not m.covers_text
+    ]
     escalate_marks = [m for m in marks if m.covers_text]
 
     mark_words: list[list[str] | None] = [None] * len(escalate_marks)

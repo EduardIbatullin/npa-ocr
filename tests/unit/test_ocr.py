@@ -468,6 +468,37 @@ def test_run_tesseract_text_drops_words_inside_non_covering_e_signature_mark(tmp
     assert blocks[0].text == "Обычный текст"
 
 
+def test_run_tesseract_text_drops_words_inside_non_covering_registration_stamp(tmp_path: Path):
+    # Решение пользователя (2026-10-21): штамп регистрации (Минюст и т.п.) —
+    # тоже служебная отметка, не текст документа, выкидывается целиком, если
+    # сам по себе ничего содержательного не перекрывает — та же логика, что
+    # уже была у электронной подписи.
+    data = _tesseract_data(
+        [
+            ("Обычный", 96, 10, 10, 80, 20),
+            ("текст", 95, 100, 10, 60, 20),
+            ("ЗАРЕГИСТРИРОВАНО", 5, 10, 200, 150, 30),
+        ]
+    )
+    data["block_num"][-1] = 2
+    data["par_num"][-1] = 2
+    data["line_num"][-1] = 2
+
+    def fake_detect(_image_path: Path, low_word_boxes: list) -> list[Mark]:
+        return [Mark(bbox=(0.0, 190.0, 200.0, 240.0), mark_type="штамп_регистрации", covers_text=False)]
+
+    blocks = run_tesseract_text(
+        Path("unused.png"),
+        [],
+        image_data_fn=lambda _p: data,
+        confidence_threshold=60,
+        detect_marks_fn=fake_detect,
+        recover_covered_text_fn=None,
+    )
+    assert len(blocks) == 1
+    assert blocks[0].text == "Обычный текст"
+
+
 def test_ocr_page_orders_tables_and_text_by_vertical_position():
     fixture = _load_simple_table_json()
     text_data = _tesseract_data([("Заголовок", 95, 10, 5, 100, 20)])

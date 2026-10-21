@@ -7,6 +7,7 @@ from npa_ocr.table_structure import (
     build_cells,
     drop_empty_columns,
     drop_empty_rows,
+    join_fragment_lines,
     merge_header_bands,
 )
 
@@ -134,3 +135,27 @@ def test_join_fragments_glues_word_parts_and_spaces_words():
         ((90.0, 60.0, 200.0, 90.0), "годам"),  # другая строка текста
     ]
     assert join_fragments(items) == "выполнения по\nгодам"
+
+
+def test_join_fragment_lines_does_not_glue_overlapping_adjacent_words():
+    # Реальные боксы RapidOCR (eslav_PP-OCRv5) на кропе ячейки из реального
+    # документа (Приказ Минприроды №565, таблица техпоказателей, ячейка
+    # «Взвешенные вещества») — два РАЗНЫХ слова, но их боксы слегка
+    # перекрываются по x (gap = 227-238 = -11), раньше это читалось как один
+    # разорванный токен и склеивалось без пробела («Взвешенныевещества»),
+    # см. docs/plan.md.
+    items = [
+        ((9.0, 30.0, 238.0, 79.0), "Взвешенные", 0.98892),
+        ((227.0, 36.0, 396.0, 79.0), "вещества", 0.9904),
+    ]
+    assert join_fragment_lines(items) == [("Взвешенные вещества", 0.98892)]
+
+
+def test_join_fragment_lines_does_not_glue_overlapping_words_second_real_example():
+    # Та же проверка на другой реальной паре слов того же документа (ячейка
+    # «Серы диоксид», gap = 174-186 = -12).
+    items = [
+        ((78.0, 0.0, 186.0, 49.0), "Серы", 0.95),
+        ((174.0, 0.0, 331.0, 43.0), "диоксид", 0.95),
+    ]
+    assert join_fragment_lines(items) == [("Серы диоксид", 0.95)]
