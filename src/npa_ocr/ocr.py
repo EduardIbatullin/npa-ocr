@@ -41,7 +41,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 import pypdf
 from PIL import Image
@@ -372,7 +372,7 @@ def run_tesseract_text(
     return blocks
 
 
-_ESCALATION_CROP_PADDING = 15  # пикселей при 200 DPI — запас вокруг строки при вырезании для ИИ-эскалации
+_ESCALATION_CROP_PADDING = 25  # пикселей при 200 DPI — запас вокруг области метки при вырезании для ИИ-эскалации
 
 _WordTuple = tuple[float, float, str, float, float, bool]  # y, x, word, w, h, low
 
@@ -391,7 +391,18 @@ def _apply_mark_escalation(
 ) -> list[tuple[float, tuple[int, int, int], list[_WordTuple]]]:
     """См. docstring run_tesseract_text. Детектор вызывается один раз на всю
     страницу (не на каждую строку) — экономит вызовы VLM, т.к. один штамп
-    обычно задевает несколько соседних строк сразу."""
+    обычно задевает несколько соседних строк сразу.
+
+    На реальном документе (Приказ №191) выяснилось эмпирически: если резать
+    область метки на мелкие кропы по отдельным словам/строкам и делать
+    отдельный вызов ИИ на каждый — модель видит крошечные обрезки без
+    видимого контекста и выдаёт мусор (9 разных вызовов на один штамп
+    регистрации дали 9 несвязанных обрывков). Поэтому восстановление теперь
+    делает ОДИН вызов на ВСЮ область метки целиком (_recover_mark_region), а
+    возвращённые слова просто по порядку раздаются на все исходные
+    низкоуверенные слова внутри метки (по чтению — сверху вниз, слева
+    направо), не по строкам — хватит слов или нет, заранее не известно, и
+    это не страшно (см. _consume_escalated_words)."""
     low_word_boxes = [
         (x, y, x + w, y + h) for _, _, words in line_items for (y, x, _word, w, h, low) in words if low
     ]
@@ -408,79 +419,75 @@ def _apply_mark_escalation(
         return line_items
 
     discard_bboxes = [m.bbox for m in marks if m.mark_type == "электронная_подпись" and not m.covers_text]
-    escalate_bboxes = [m.bbox for m in marks if m.covers_text]
+    escalate_marks = [m for m in marks if m.covers_text]
 
-    page_image = None
-    if escalate_bboxes and recover_covered_text_fn is not None:
+    mark_words: list[list[str] | None] = [None] * len(escalate_marks)
+    if escalate_marks and recover_covered_text_fn is not None:
         page_image = Image.open(image_path)
+        for i, mark in enumerate(escalate_marks):
+            mark_words[i] = _recover_mark_region(page_image, mark.bbox, recover_covered_text_fn)
+    mark_iters = [iter(words) if words else None for words in mark_words]
 
     result = []
     for _y, key, words in line_items:
         kept = words
         if discard_bboxes:
             kept = [w for w in kept if not _point_in_any_box(*_word_center(w), discard_bboxes)]
-        if escalate_bboxes and page_image is not None:
-            kept = _escalate_words_in_marks(kept, escalate_bboxes, page_image, recover_covered_text_fn)
+        if escalate_marks:
+            kept = _consume_escalated_words(kept, escalate_marks, mark_iters)
         if kept:
             result.append((min(w[0] for w in kept), key, kept))
     return result
 
 
-def _escalate_words_in_marks(
+def _consume_escalated_words(
     words: list[_WordTuple],
-    escalate_bboxes: list[Box],
-    page_image: Image.Image,
-    recover_fn: Callable[[Path], str],
+    escalate_marks: list[mark_detection.Mark],
+    mark_iters: list[Iterator[str] | None],
 ) -> list[_WordTuple]:
-    """words — одна строка, уже отсортирована по x (см. _apply_mark_escalation).
-    Подряд идущие слова, одновременно низкоуверенные И попадающие в область
-    метки с covers_text=True, вырезаются вместе (с запасом) и пробуют
-    восстановиться одним вызовом ИИ-эскалации (меньше вызовов, больше
-    контекста модели, чем по одному слову). Результат всё равно помечается
-    low=True, см. docstring run_tesseract_text."""
+    """Низкоуверенные слова, попадающие в область метки с covers_text=True,
+    заменяются следующим словом из уже восстановленного для этой метки
+    текста (единый вызов на всю метку — см. _apply_mark_escalation), пока
+    слова не кончатся; если их не хватило или эскалация для метки не
+    удалась — исходное (сырое) слово остаётся как было, не теряем информацию
+    молча. Результат всё равно помечается low=True, см. docstring
+    run_tesseract_text."""
     result: list[_WordTuple] = []
-    i, n = 0, len(words)
-    while i < n:
-        word = words[i]
-        if not (word[5] and _point_in_any_box(*_word_center(word), escalate_bboxes)):
+    for word in words:
+        if not word[5]:
             result.append(word)
-            i += 1
             continue
-        j = i + 1
-        while j < n and words[j][5] and _point_in_any_box(*_word_center(words[j]), escalate_bboxes):
-            j += 1
-        run = words[i:j]
-        recovered = _recover_run(page_image, run, recover_fn)
-        if recovered is None:
-            result.extend(run)
-        else:
-            y0 = min(w[0] for w in run)
-            x0 = min(w[1] for w in run)
-            x1 = max(w[1] + w[3] for w in run)
-            h0 = max(w[4] for w in run)
-            per_word_w = (x1 - x0) / max(len(recovered), 1)
-            result.extend(
-                (y0, x0 + idx * per_word_w, recovered_word, per_word_w, h0, True)
-                for idx, recovered_word in enumerate(recovered)
-            )
-        i = j
+        cx, cy = _word_center(word)
+        mark_index = next(
+            (i for i, m in enumerate(escalate_marks) if m.bbox[0] <= cx <= m.bbox[2] and m.bbox[1] <= cy <= m.bbox[3]),
+            None,
+        )
+        iterator = mark_iters[mark_index] if mark_index is not None else None
+        recovered_word = next(iterator, None) if iterator is not None else None
+        if recovered_word is None:
+            result.append(word)
+            continue
+        y, x, _text, w, h, _low = word
+        result.append((y, x, recovered_word, w, h, True))
     return result
 
 
-def _recover_run(
+def _recover_mark_region(
     page_image: Image.Image,
-    run: list[_WordTuple],
+    mark_bbox: Box,
     recover_fn: Callable[[Path], str],
 ) -> list[str] | None:
-    """None — эскалация не дала результата (сеть/таймаут/пустой ответ) —
-    вызывающая сторона оставляет run как есть (сырой текст Tesseract, тот же
-    низкий confidence, ничего не теряем). Любая ошибка recover_fn ловится
-    широко (Exception) намеренно — это необязательное улучшение, оно не
-    должно уронить основной пайплайн распознавания."""
-    x0 = min(w[1] for w in run) - _ESCALATION_CROP_PADDING
-    y0 = min(w[0] for w in run) - _ESCALATION_CROP_PADDING
-    x1 = max(w[1] + w[3] for w in run) + _ESCALATION_CROP_PADDING
-    y1 = max(w[0] + w[4] for w in run) + _ESCALATION_CROP_PADDING
+    """Один вызов ИИ-эскалации на всю область найденной метки (с запасом
+    _ESCALATION_CROP_PADDING) — см. docstring _apply_mark_escalation, почему
+    не по частям. None — эскалация не дала результата (сеть/таймаут/пустой
+    ответ) — вызывающая сторона оставляет исходные слова как есть. Любая
+    ошибка recover_fn ловится широко (Exception) намеренно — это
+    необязательное улучшение, оно не должно уронить основной пайплайн
+    распознавания."""
+    x0 = mark_bbox[0] - _ESCALATION_CROP_PADDING
+    y0 = mark_bbox[1] - _ESCALATION_CROP_PADDING
+    x1 = mark_bbox[2] + _ESCALATION_CROP_PADDING
+    y1 = mark_bbox[3] + _ESCALATION_CROP_PADDING
     box = (
         max(0, int(x0)),
         max(0, int(y0)),
@@ -501,7 +508,7 @@ def _recover_run(
     finally:
         tmp_path.unlink(missing_ok=True)
     words = text.split()
-    print(f"[ИИ-эскалация] восстановлено: {' '.join(words)!r}", file=sys.stderr)
+    print(f"[ИИ-эскалация] восстановлено для области {mark_bbox}: {' '.join(words)!r}", file=sys.stderr)
     return words or None
 
 
