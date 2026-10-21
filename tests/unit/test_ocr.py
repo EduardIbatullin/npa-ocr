@@ -8,7 +8,9 @@ import json
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
+from npa_ocr.mark_detection import Mark
 from npa_ocr.ocr import (
     UNRECOGNIZABLE_MARK,
     OcrDocumentResult,
@@ -385,6 +387,85 @@ def test_run_tesseract_text_without_authority_name_leaves_mark_as_is():
     )
     assert blocks[0].text == "Председатель Правительства"
     assert blocks[0].low_words == (False, True)
+
+
+def test_run_tesseract_text_without_detect_marks_fn_is_unaffected():
+    # Без detect_marks_fn (None, значение по умолчанию) поведение не должно
+    # отличаться от версии до появления ИИ-эскалации — регрессионная проверка.
+    data = _tesseract_data(
+        [
+            ("Председатель", 96, 10, 10, 100, 20),
+            ("Правительства", 1, 120, 10, 100, 20),
+        ]
+    )
+    blocks = run_tesseract_text(Path("unused.png"), [], image_data_fn=lambda _p: data, confidence_threshold=60)
+    assert blocks[0].text == "Председатель Правительства"
+    assert blocks[0].low_words == (False, True)
+
+
+def test_run_tesseract_text_escalates_low_confidence_words_under_covering_mark(tmp_path: Path):
+    # Сценарий из docs/plan.md: эвристика нашла кандидата (скопление
+    # низкоуверенных слов), detect_marks_fn (фейк) подтверждает — это печать,
+    # перекрывающая текст документа; recover_covered_text_fn (фейк) отдаёт
+    # восстановленный текст. Результат остаётся low=True — проверять руками.
+    image_path = tmp_path / "page.png"
+    Image.new("RGB", (400, 100), "white").save(image_path)
+    data = _tesseract_data(
+        [
+            ("Председатель", 96, 10, 10, 100, 20),
+            ("Прав", 1, 120, 10, 40, 20),  # под печатью, обрезано
+            ("Д.Медведев", 95, 230, 10, 100, 20),
+        ]
+    )
+
+    def fake_detect(_image_path: Path, low_word_boxes: list) -> list[Mark]:
+        assert low_word_boxes == [(120.0, 10.0, 160.0, 30.0)]
+        return [Mark(bbox=(115.0, 5.0, 165.0, 35.0), mark_type="печать", covers_text=True)]
+
+    def fake_recover(_crop_path: Path) -> str:
+        return "Правительства"
+
+    blocks = run_tesseract_text(
+        image_path,
+        [],
+        image_data_fn=lambda _p: data,
+        confidence_threshold=60,
+        detect_marks_fn=fake_detect,
+        recover_covered_text_fn=fake_recover,
+    )
+    assert blocks[0].text == "Председатель Правительства Д.Медведев"
+    assert blocks[0].low_words == (False, True, False)
+
+
+def test_run_tesseract_text_drops_words_inside_non_covering_e_signature_mark(tmp_path: Path):
+    # Пример Постановление №710 (docs/plan.md): штамп электронной подписи внизу
+    # страницы — чистый визуальный мусор, не текст документа, не перекрывает
+    # ничего содержательного. Слова внутри такой метки исключаются целиком, а
+    # не просто выделяются как низкая уверенность.
+    data = _tesseract_data(
+        [
+            ("Обычный", 96, 10, 10, 80, 20),
+            ("текст", 95, 100, 10, 60, 20),
+            ("abcDEF123", 5, 10, 200, 150, 30),  # штамп э-подписи, отдельная строка
+        ]
+    )
+    data["block_num"][-1] = 2
+    data["par_num"][-1] = 2
+    data["line_num"][-1] = 2
+
+    def fake_detect(_image_path: Path, low_word_boxes: list) -> list[Mark]:
+        return [Mark(bbox=(0.0, 190.0, 200.0, 240.0), mark_type="электронная_подпись", covers_text=False)]
+
+    blocks = run_tesseract_text(
+        Path("unused.png"),
+        [],
+        image_data_fn=lambda _p: data,
+        confidence_threshold=60,
+        detect_marks_fn=fake_detect,
+        recover_covered_text_fn=None,
+    )
+    assert len(blocks) == 1
+    assert blocks[0].text == "Обычный текст"
 
 
 def test_ocr_page_orders_tables_and_text_by_vertical_position():

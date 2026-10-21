@@ -46,7 +46,7 @@ from typing import Callable
 import pypdf
 from PIL import Image
 
-from npa_ocr import table_structure
+from npa_ocr import ai_escalation, mark_detection, table_structure
 from npa_ocr.ocr_table import TableCell, normalize_header_text, reconstruct_table
 from npa_ocr.table_structure import TableStructure
 
@@ -288,6 +288,8 @@ def run_tesseract_text(
     image_data_fn: Callable[[Path], dict],
     confidence_threshold: int = DEFAULT_CONFIDENCE_THRESHOLD,
     authority_name: str | None = None,
+    detect_marks_fn: Callable[[Path, list[Box]], list[mark_detection.Mark]] | None = None,
+    recover_covered_text_fn: Callable[[Path], str] | None = None,
 ) -> list[TextBlock]:
     """image_data_fn возвращает словарь формата pytesseract.image_to_data(...,
     output_type=Output.DICT) (ключи text/conf/left/top/width/height/block_num/
@@ -297,7 +299,22 @@ def run_tesseract_text(
     а не угадываются — см. docs/plan.md, «Печать/подпись». authority_name —
     если задан, формула должности восстанавливается по всей странице сквозным
     поиском по словам (строки Tesseract у штампа ненадёжны), см.
-    _restore_signatory_title_words."""
+    _restore_signatory_title_words.
+
+    detect_marks_fn/recover_covered_text_fn — опциональная ИИ-эскалация текста
+    под печатью/штампом (см. mark_detection.py, ai_escalation.py, docs/plan.md,
+    «ИИ-эскалация»). По умолчанию (None) ничего не меняется — поведение то же,
+    что и раньше (низкая уверенность просто выделяется в DOCX). Когда заданы:
+    detect_marks_fn находит и классифицирует подозрительные области по уже
+    вычисленным bbox низкоуверенных слов (без лишних вызовов VLM на обычных
+    страницах без таких областей); для меток с covers_text=True
+    низкоуверенные слова внутри области пробуют восстановиться через
+    recover_covered_text_fn — результат всё равно остаётся с low=True
+    (ИИ-восстановленный текст — не замена честной неуверенности слепым
+    доверием, подлежит проверке человеком, как и раньше); слова внутри меток
+    типа «электронная_подпись» с covers_text=False (собственное содержимое
+    метки — не текст документа) исключаются из текста целиком, см. пример
+    Постановление №710 в docs/plan.md."""
     data = image_data_fn(image_path)
     lines: dict[tuple[int, int, int], list[tuple[float, float, str, float, float, bool]]] = {}
     for i in range(len(data["text"])):
@@ -319,6 +336,14 @@ def run_tesseract_text(
         y = min(w[0] for w in words)
         line_items.append((y, key, words))
     line_items.sort(key=lambda item: item[0])
+
+    if detect_marks_fn is not None:
+        line_items = _apply_mark_escalation(
+            line_items,
+            image_path,
+            detect_marks_fn=detect_marks_fn,
+            recover_covered_text_fn=recover_covered_text_fn,
+        )
 
     flat_words = [w[2] for _, _, words in line_items for w in words]
     flat_low = [w[5] for _, _, words in line_items for w in words]
@@ -345,6 +370,131 @@ def run_tesseract_text(
             )
         )
     return blocks
+
+
+_ESCALATION_CROP_PADDING = 15  # пикселей при 200 DPI — запас вокруг строки при вырезании для ИИ-эскалации
+
+_WordTuple = tuple[float, float, str, float, float, bool]  # y, x, word, w, h, low
+
+
+def _word_center(word: _WordTuple) -> tuple[float, float]:
+    y, x, _word, w, h, _low = word
+    return x + w / 2, y + h / 2
+
+
+def _apply_mark_escalation(
+    line_items: list[tuple[float, tuple[int, int, int], list[_WordTuple]]],
+    image_path: Path,
+    *,
+    detect_marks_fn: Callable[[Path, list[Box]], list[mark_detection.Mark]],
+    recover_covered_text_fn: Callable[[Path], str] | None,
+) -> list[tuple[float, tuple[int, int, int], list[_WordTuple]]]:
+    """См. docstring run_tesseract_text. Детектор вызывается один раз на всю
+    страницу (не на каждую строку) — экономит вызовы VLM, т.к. один штамп
+    обычно задевает несколько соседних строк сразу."""
+    low_word_boxes = [
+        (x, y, x + w, y + h) for _, _, words in line_items for (y, x, _word, w, h, low) in words if low
+    ]
+    if not low_word_boxes:
+        return line_items
+    marks = detect_marks_fn(image_path, low_word_boxes)
+    if not marks:
+        return line_items
+
+    discard_bboxes = [m.bbox for m in marks if m.mark_type == "электронная_подпись" and not m.covers_text]
+    escalate_bboxes = [m.bbox for m in marks if m.covers_text]
+
+    page_image = None
+    if escalate_bboxes and recover_covered_text_fn is not None:
+        page_image = Image.open(image_path)
+
+    result = []
+    for _y, key, words in line_items:
+        kept = words
+        if discard_bboxes:
+            kept = [w for w in kept if not _point_in_any_box(*_word_center(w), discard_bboxes)]
+        if escalate_bboxes and page_image is not None:
+            kept = _escalate_words_in_marks(kept, escalate_bboxes, page_image, recover_covered_text_fn)
+        if kept:
+            result.append((min(w[0] for w in kept), key, kept))
+    return result
+
+
+def _escalate_words_in_marks(
+    words: list[_WordTuple],
+    escalate_bboxes: list[Box],
+    page_image: Image.Image,
+    recover_fn: Callable[[Path], str],
+) -> list[_WordTuple]:
+    """words — одна строка, уже отсортирована по x (см. _apply_mark_escalation).
+    Подряд идущие слова, одновременно низкоуверенные И попадающие в область
+    метки с covers_text=True, вырезаются вместе (с запасом) и пробуют
+    восстановиться одним вызовом ИИ-эскалации (меньше вызовов, больше
+    контекста модели, чем по одному слову). Результат всё равно помечается
+    low=True, см. docstring run_tesseract_text."""
+    result: list[_WordTuple] = []
+    i, n = 0, len(words)
+    while i < n:
+        word = words[i]
+        if not (word[5] and _point_in_any_box(*_word_center(word), escalate_bboxes)):
+            result.append(word)
+            i += 1
+            continue
+        j = i + 1
+        while j < n and words[j][5] and _point_in_any_box(*_word_center(words[j]), escalate_bboxes):
+            j += 1
+        run = words[i:j]
+        recovered = _recover_run(page_image, run, recover_fn)
+        if recovered is None:
+            result.extend(run)
+        else:
+            y0 = min(w[0] for w in run)
+            x0 = min(w[1] for w in run)
+            x1 = max(w[1] + w[3] for w in run)
+            h0 = max(w[4] for w in run)
+            per_word_w = (x1 - x0) / max(len(recovered), 1)
+            result.extend(
+                (y0, x0 + idx * per_word_w, recovered_word, per_word_w, h0, True)
+                for idx, recovered_word in enumerate(recovered)
+            )
+        i = j
+    return result
+
+
+def _recover_run(
+    page_image: Image.Image,
+    run: list[_WordTuple],
+    recover_fn: Callable[[Path], str],
+) -> list[str] | None:
+    """None — эскалация не дала результата (сеть/таймаут/пустой ответ) —
+    вызывающая сторона оставляет run как есть (сырой текст Tesseract, тот же
+    низкий confidence, ничего не теряем). Любая ошибка recover_fn ловится
+    широко (Exception) намеренно — это необязательное улучшение, оно не
+    должно уронить основной пайплайн распознавания."""
+    x0 = min(w[1] for w in run) - _ESCALATION_CROP_PADDING
+    y0 = min(w[0] for w in run) - _ESCALATION_CROP_PADDING
+    x1 = max(w[1] + w[3] for w in run) + _ESCALATION_CROP_PADDING
+    y1 = max(w[0] + w[4] for w in run) + _ESCALATION_CROP_PADDING
+    box = (
+        max(0, int(x0)),
+        max(0, int(y0)),
+        min(page_image.width, int(x1)),
+        min(page_image.height, int(y1)),
+    )
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return None
+    crop = page_image.crop(box)
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        crop.save(tmp.name)
+        tmp_path = Path(tmp.name)
+    try:
+        text = recover_fn(tmp_path)
+    except Exception:
+        return None
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    words = text.split()
+    return words or None
 
 
 _TABLE_CROP_PADDING = 20  # пикселей при 200 DPI — запас вокруг таблицы при вырезании
@@ -692,9 +842,12 @@ def ocr_page(
     confidence_threshold: int = DEFAULT_CONFIDENCE_THRESHOLD,
     authority_name: str | None = None,
     table_blocks_fn: Callable[[Path], list[TableBlock]] | None = None,
+    detect_marks_fn: Callable[[Path, list[Box]], list[mark_detection.Mark]] | None = None,
+    recover_covered_text_fn: Callable[[Path], str] | None = None,
 ) -> list[PageBlock]:
     """Таблицы и обычный текст страницы, слитые в порядке чтения (сверху вниз).
-    Таблицы — через table_blocks_fn (TATR) или predict_tables_fn (прежний путь PaddleOCR)."""
+    Таблицы — через table_blocks_fn (TATR) или predict_tables_fn (прежний путь PaddleOCR).
+    detect_marks_fn/recover_covered_text_fn — см. run_tesseract_text."""
     if table_blocks_fn is not None:
         tables = table_blocks_fn(image_path)
     else:
@@ -705,6 +858,8 @@ def ocr_page(
         image_data_fn=image_data_fn,
         confidence_threshold=confidence_threshold,
         authority_name=authority_name,
+        detect_marks_fn=detect_marks_fn,
+        recover_covered_text_fn=recover_covered_text_fn,
     )
     blocks: list[PageBlock] = [*tables, *text_blocks]
     blocks.sort(key=lambda b: b.y)
@@ -1039,6 +1194,13 @@ def _default_image_data_fn(image_path: Path) -> dict:
         return pytesseract.image_to_data(img, lang="rus", output_type=pytesseract.Output.DICT)
 
 
+def _default_detect_marks_fn(image_path: Path, low_word_boxes: list[Box]) -> list[mark_detection.Mark]:
+    """Детектор по умолчанию: эвристика mark_detection.cluster_candidate_regions
+    + классификация через настоящую Ollama (ai_escalation.classify_mark). См.
+    docs/plan.md, «ИИ-эскалация»."""
+    return mark_detection.detect_marks(image_path, low_word_boxes, classify_fn=ai_escalation.classify_mark)
+
+
 # --- Постраничное сохранение и возобновление ---
 
 # Сырые результаты страницы (блоки с координатами, таблицы, флаги уверенности) пишутся
@@ -1213,12 +1375,19 @@ def ocr_document(
     pages_dir: Path | str | None = None,
     resume: bool = True,
     progress_fn: Callable[[int, int, int, str], None] | None = None,
+    use_ai_escalation: bool = False,
 ) -> OcrDocumentResult:
     """Точка входа этапа 3. Постранично: если у страницы уже есть текстовый слой
     (>= min_page_text_chars символов) — используется он как есть, OCR не
     запускается (см. docs/plan.md, «Охват» — справочники ИТС почти всегда
     уже с текстом). Иначе страница рендерится в изображение и распознаётся
     гибридной схемой (см. docstring модуля).
+
+    use_ai_escalation — по умолчанию выключено: требует доступа к Ollama по
+    сети (см. ai_escalation.OLLAMA_URL) и ощутимо замедляет страницы со
+    штампами/печатями (VLM-инференс на CPU без GPU — десятки секунд на
+    область). Включает поиск печатей/штампов/э-подписей и восстановление
+    текста под ними, см. run_tesseract_text, docs/plan.md «ИИ-эскалация».
 
     predict_tables_fn/image_data_fn — инъекция движков; по умолчанию настоящие
     тяжёлые модели (см. _default_predict_tables_fn/_default_image_data_fn), в
@@ -1352,6 +1521,8 @@ def ocr_document(
                     image_data_fn=timed_image_data,
                     confidence_threshold=confidence_threshold,
                     authority_name=authority_name,
+                    detect_marks_fn=_default_detect_marks_fn if use_ai_escalation else None,
+                    recover_covered_text_fn=ai_escalation.recover_covered_text if use_ai_escalation else None,
                 )
             else:
                 blocks = ocr_page(
@@ -1360,6 +1531,8 @@ def ocr_document(
                     image_data_fn=timed_image_data,
                     confidence_threshold=confidence_threshold,
                     authority_name=authority_name,
+                    detect_marks_fn=_default_detect_marks_fn if use_ai_escalation else None,
+                    recover_covered_text_fn=ai_escalation.recover_covered_text if use_ai_escalation else None,
                 )
             page = PageResult(
                 page_number=page_number,

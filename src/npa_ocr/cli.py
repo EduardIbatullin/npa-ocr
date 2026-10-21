@@ -61,6 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Распознать все страницы заново, даже если они уже сохранены в --pages-dir",
     )
+    parser.add_argument(
+        "--ai-escalation",
+        action="store_true",
+        help=(
+            "Восстанавливать текст под печатью/штампом через локальную VLM (Ollama, "
+            "см. ai_escalation.py) — требует сеть до Ollama (OLLAMA_URL) и заметно "
+            "медленнее на страницах с печатями/штампами. По умолчанию выключено."
+        ),
+    )
     return parser
 
 
@@ -76,6 +85,7 @@ def cmd_ocr(args: argparse.Namespace) -> int:
             min_free_memory_mb=args.min_free_mb,
             pages_dir=args.pages_dir,
             resume=not args.no_resume,
+            use_ai_escalation=args.ai_escalation,
         )
     except InsufficientMemoryError as exc:
         print(json.dumps({"status": "insufficient_memory", "message": str(exc)}, ensure_ascii=False, indent=2))
