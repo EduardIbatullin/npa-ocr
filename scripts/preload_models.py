@@ -30,6 +30,18 @@ SIGILL — не только в рантайме, но и здесь, на эт�
 начавшейся загрузки посреди инференса). Поэтому движок явно вызывается на
 тестовом изображении ниже (`_preload_rapidocr_rec_model`), не только
 создаётся.
+
+Первая версия этого фикса (2026-10-22, до вот этой правки) вызывала движок
+на ПУСТОМ белом изображении без текста — и всё равно не помогло: детектор
+на пустой картинке не находит текстовых областей («the text detection
+result is empty»), а значит до распознавателя дело просто не доходит —
+lazy-загрузка eslav-модели не срабатывает. Проверено на реальной сборке
+(build9): после неё `eslav_PP-OCRv5_rec_mobile.onnx` всё ещё отсутствовал
+в образе. Поэтому болванка теперь содержит настоящий нарисованный текст —
+детектору есть что найти, и вызов реально доходит до распознавателя.
+Используется встроенный шрифт Pillow (`ImageFont.load_default`), а не
+системный (например `arial.ttf`) — в собранном Linux-образе системных
+шрифтов нет.
 """
 
 from __future__ import annotations
@@ -37,7 +49,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from npa_ocr import table_structure
 from npa_ocr.ocr import _default_cell_text_fn, _default_predict_tables_fn, _paddle_runtime_usable
@@ -47,7 +59,9 @@ def _preload_rapidocr_rec_model() -> None:
     read = _default_cell_text_fn()
     with tempfile.TemporaryDirectory() as tmp_dir:
         dummy_path = Path(tmp_dir) / "dummy.png"
-        Image.new("RGB", (64, 32), "white").save(dummy_path)
+        img = Image.new("RGB", (200, 60), "white")
+        ImageDraw.Draw(img).text((5, 5), "TEST", fill="black", font=ImageFont.load_default(size=40))
+        img.save(dummy_path)
         read(dummy_path)
 
 
