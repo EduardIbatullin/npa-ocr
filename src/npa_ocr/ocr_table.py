@@ -154,6 +154,7 @@ _HEADER_ABBREVIATIONS_SUBSTRING: dict[str, str] = {
     "MΓ/HM3": "мг/нм³",
     "MΓ/HM": "мг/нм³",
     "Mr/HM33": "мг/нм³",
+    "Mr/HM3": "мг/нм³",
     "KΓ/T": "кг/т",
 }
 

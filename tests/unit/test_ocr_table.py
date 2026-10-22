@@ -103,6 +103,7 @@ def test_normalize_header_text_real_observed_garbling():
     assert normalize_header_text("MΓ/HM3") == "мг/нм³"
     assert normalize_header_text("MΓ/HM") == "мг/нм³"
     assert normalize_header_text("Mr/HM33") == "мг/нм³"
+    assert normalize_header_text("Mr/HM3") == "мг/нм³"
     assert normalize_header_text("KΓ/T") == "кг/т"
     assert normalize_header_text("Γ.") == "г."
     assert normalize_header_text("(снижение с мг/дмз,") == "(снижение с мг/дм³,"

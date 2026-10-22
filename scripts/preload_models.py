@@ -17,12 +17,39 @@ SIGILL — не только в рантайме, но и здесь, на эт�
 сам пропускает PPStructureV3 и уходит на Tesseract-фоллбэк для регионов
 таблиц (см. `table_regions_for_page`, `ocr_document`). Текст ячеек
 (RapidOCR/ONNX) от этого не зависит и грузится всегда.
+
+Для RapidOCR мало просто СОЗДАТЬ движок (`RapidOCR(params=...)`) — проверено
+на реальном деплое (2026-10-22): конструктор грузит только детектор и
+классификатор (общие для всех языков, идут в комплекте), а языковая модель
+распознавания (eslav_PP-OCRv5_rec_mobile, specific to Rec.lang_type=ESLAV)
+скачивается ЛЕНИВО — только при первом настоящем вызове движка на
+изображении. Без явного вызова она оставалась не в образе, а значит
+качалась с ModelScope при первом же реальном документе в проде (первый
+же прогон после пересборки упал без трассировки — с высокой вероятностью
+именно из-за этого: нестабильная сеть к ModelScope в момент лениво
+начавшейся загрузки посреди инференса). Поэтому движок явно вызывается на
+тестовом изображении ниже (`_preload_rapidocr_rec_model`), не только
+создаётся.
 """
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
+from PIL import Image
+
 from npa_ocr import table_structure
 from npa_ocr.ocr import _default_cell_text_fn, _default_predict_tables_fn, _paddle_runtime_usable
+
+
+def _preload_rapidocr_rec_model() -> None:
+    read = _default_cell_text_fn()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        dummy_path = Path(tmp_dir) / "dummy.png"
+        Image.new("RGB", (64, 32), "white").save(dummy_path)
+        read(dummy_path)
+
 
 print("Загрузка TATR (структура)...")
 table_structure.load_tatr()
@@ -40,6 +67,6 @@ else:
     )
 
 print("Загрузка RapidOCR (eslav_PP-OCRv5, текст ячеек таблиц)...")
-_default_cell_text_fn()
+_preload_rapidocr_rec_model()
 
 print("Все модели закэшированы.")
