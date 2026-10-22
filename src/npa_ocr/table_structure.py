@@ -186,6 +186,28 @@ def drop_empty_rows(structure: TableStructure, texts: list[tuple[Box, str]]) -> 
 
 
 FRAGMENT_GAP_RATIO = 0.12  # зазор между фрагментами одного слова — доля высоты строки
+# Доля площади короткого бокса, перекрытая другим боксом той же строки, начиная с
+# которой он считается дублирующей детекцией (не отдельным фрагментом текста).
+_DUPLICATE_CONTAINMENT_RATIO = 0.5
+_DUPLICATE_MAX_TEXT_LEN = 2  # дублирующая детекция — всегда короткий огрызок (цифра/символ)
+
+
+def _box_area(box: Box) -> float:
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def _is_duplicate_fragment(box: Box, others: list[Box]) -> bool:
+    """True, если box почти целиком лежит внутри какого-то из others — см.
+    docstring join_fragment_lines, «надстрочная цифра детектируется дважды»."""
+    area = _box_area(box)
+    if area <= 0:
+        return False
+    for other in others:
+        ix = max(0.0, min(box[2], other[2]) - max(box[0], other[0]))
+        iy = max(0.0, min(box[3], other[3]) - max(box[1], other[1]))
+        if (ix * iy) / area >= _DUPLICATE_CONTAINMENT_RATIO:
+            return True
+    return False
 
 
 def join_fragment_lines(items: list[tuple[Box, str, float]]) -> list[tuple[str, float]]:
@@ -202,7 +224,27 @@ def join_fragment_lines(items: list[tuple[Box, str, float]]) -> list[tuple[str, 
     из-за чего раньше эти пары слипались в одно без пробела
     («Взвешенныевещества»). Условие `gap >= 0` защищает только от склейки
     случая, когда гарантированно НЕТ пробела (боксы касаются/чуть
-    перекрываются в самом деле), не от обычного слегка неточного детектора."""
+    перекрываются в самом деле), не от обычного слегка неточного детектора.
+
+    Отдельная, более редкая проблема — надстрочная цифра («мг/нм³») детектируется
+    ДВАЖДЫ: один раз как часть основного бокса («MΓ/HM3», надстрочная «³» уже
+    внутри, просто не надстрочная), и ещё раз отдельным мелким боксом вокруг того
+    же самого символа (проверено впрямую на двух реальных кропах той же ячейки
+    в разных местах документа — короткий бокс «3» на ~86% и ~100% перекрыт
+    основным боксом). Такие короткие (<= _DUPLICATE_MAX_TEXT_LEN символов),
+    почти целиком вложенные в другой бокс фрагменты отбрасываются целиком — не
+    добавляются ни с пробелом, ни без (_is_duplicate_fragment)."""
+    if not items:
+        return []
+    boxes_only = [box for box, _text, _score in items]
+    items = [
+        (box, text, score)
+        for box, text, score in items
+        if not (
+            len(text) <= _DUPLICATE_MAX_TEXT_LEN
+            and _is_duplicate_fragment(box, [b for b in boxes_only if b != box])
+        )
+    ]
     if not items:
         return []
     lines: list[list[tuple[Box, str, float]]] = []
