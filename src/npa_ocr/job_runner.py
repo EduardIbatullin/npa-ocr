@@ -84,6 +84,8 @@ class Job:
     started_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     error: str | None = None
+    authority_name: str | None = None
+    retries: int = 0
 
     def to_dict(self) -> dict:
         """Снимок состояния для JSON-ответа (GET /jobs/{job_id})."""
@@ -99,6 +101,7 @@ class Job:
             "steps": progress["steps"],
             "elapsed_seconds": round((self.finished_at or time.time()) - self.started_at),
             "return_code": self.return_code,
+            "retries": self.retries,
             "error": self.error,
         }
 
@@ -124,7 +127,20 @@ class JobManager:
             это обеспечивает вызывающий код (см. npa_ocr.server).
         command_builder: как собрать команду запуска — по умолчанию настоящий
             CLI (_default_command), в тестах подменяется на фейковую команду.
+
+    Падение подпроцесса по сигналу (return_code < 0 — так subprocess.Popen
+    сообщает о завершении сигналом, например -4 для SIGILL) автоматически
+    повторяется до MAX_CRASH_RETRIES раз: это флаки-краш, не ошибка в данных
+    (см. docs/plan.md, «Флаки-SIGILL» — гонка потоков BLAS/OpenMP при первом
+    TATR-инференсе на CPU без AVX2/FMA; сам подпроцесс гибнет мгновенно без
+    трейсбека, сервер и прочие задания не страдают). Повтор — тот же CLI-вызов
+    с тем же --out: CLI резюмирует с pages_dir (см. ocr_document, resume=True
+    по умолчанию) и пропускает уже сохранённые страницы — _save_page пишет их
+    атомарно (.part + os.replace), так что крах посреди записи страницы не
+    оставляет полуготового файла, который резюм принял бы за готовый.
     """
+
+    MAX_CRASH_RETRIES = 2
 
     def __init__(
         self,
@@ -169,20 +185,29 @@ class JobManager:
                 docx_path=docx_path,
                 progress_path=progress_path,
                 log_path=self.jobs_root / f"{stem}.log",
+                authority_name=authority_name,
             )
-            env = {
-                **os.environ,
-                "PYTHONIOENCODING": "utf-8",
-                "PYTHONUTF8": "1",
-                "FLAGS_use_mkldnn": "false",
-            }
-            cmd = self._command_builder(pdf_path, docx_path, authority_name)
-            with open(job.log_path, "wb") as stdout_file, open(progress_path, "wb") as stderr_file:
-                job.process = subprocess.Popen(cmd, stdout=stdout_file, stderr=stderr_file, env=env)
+            job.process = self._spawn(job)
             self._jobs[job.job_id] = job
             self._current = job
         threading.Thread(target=self._watch, args=(job,), daemon=True).start()
         return job
+
+    def _spawn(self, job: Job) -> subprocess.Popen:
+        """Запускает CLI npa-ocr для job (исходный запуск или повтор после краха —
+        см. _watch). stdout (log_path) — заново с нуля: контракт CLI печатает
+        туда финальный JSON только при успехе, прошлый краш там и так пуст.
+        stderr (progress_path) — дозаписью: _watch перед повтором уже добавил в
+        него отметку о краше (см. _log_crash_retry), её не нужно терять."""
+        env = {
+            **os.environ,
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+            "FLAGS_use_mkldnn": "false",
+        }
+        cmd = self._command_builder(job.pdf_path, job.docx_path, job.authority_name)
+        with open(job.log_path, "wb") as stdout_file, open(job.progress_path, "ab") as stderr_file:
+            return subprocess.Popen(cmd, stdout=stdout_file, stderr=stderr_file, env=env)
 
     def cancel(self, job: Job) -> None:
         """Останавливает задание, если оно ещё выполняется; иначе ничего не делает."""
@@ -198,26 +223,49 @@ class JobManager:
         Работает в отдельном потоке (см. start). Не трогает статус, если задание
         уже отменено (cancel уже выставил "cancelled") — не перезатирает его на
         "failed" из-за ненулевого кода возврата после kill().
+
+        Падение по сигналу (code < 0) перезапускает тот же CLI-вызов до
+        MAX_CRASH_RETRIES раз вместо немедленного "failed" — см. докстринг
+        класса.
         """
-        code = job.process.wait()
-        with self._lock:
-            job.return_code = code
-            job.finished_at = time.time()
-            if job.status == "cancelled":
+        while True:
+            code = job.process.wait()
+            with self._lock:
+                job.return_code = code
+                if job.status == "cancelled":
+                    job.finished_at = time.time()
+                    return
+                if code < 0 and job.retries < self.MAX_CRASH_RETRIES:
+                    job.retries += 1
+                    self._log_crash_retry(job, code)
+                    job.process = self._spawn(job)
+                    continue
+                job.finished_at = time.time()
+                if code == 0 and job.docx_path.is_file():
+                    job.status = "done"
+                else:
+                    job.status = "failed"
+                    job.error = self._failure_reason(job)
                 return
-            if code == 0 and job.docx_path.is_file():
-                job.status = "done"
-            else:
-                job.status = "failed"
-                job.error = self._failure_reason(job)
 
     @staticmethod
-    def _failure_reason(job: Job) -> str:
+    def _log_crash_retry(job: Job, code: int) -> None:
+        """Дописывает в журнал прогресса отметку о краше подпроцесса сигналом и
+        о повторе — чтобы след краха не терялся молча (см. _spawn)."""
+        marker = f"\n--- подпроцесс упал (сигнал {-code}), повтор {job.retries}/{JobManager.MAX_CRASH_RETRIES} ---\n"
+        try:
+            with open(job.progress_path, "a", encoding="utf-8") as f:
+                f.write(marker)
+        except OSError:
+            pass
+
+    def _failure_reason(self, job: Job) -> str:
         """Человекочитаемая причина неудачи задания.
 
         CLI npa-ocr при нехватке памяти печатает JSON со статусом в stdout — если
         получилось его распарсить, возвращает это сообщение; иначе — обобщённый
-        текст с кодом возврата и ссылкой на журнал прогресса.
+        текст с кодом возврата (и числом попыток, если были повторы после краха)
+        и ссылкой на журнал прогресса.
         """
         try:
             out = json.loads(job.log_path.read_text(encoding="utf-8", errors="replace"))
@@ -225,4 +273,5 @@ class JobManager:
                 return out.get("message", "Недостаточно памяти")
         except (OSError, ValueError):
             pass
-        return f"Распознавание завершилось с кодом {job.return_code}. Журнал: {job.progress_path.name}"
+        attempts_note = f" (после {job.retries + 1} попыток)" if job.retries else ""
+        return f"Распознавание завершилось с кодом {job.return_code}{attempts_note}. Журнал: {job.progress_path.name}"
