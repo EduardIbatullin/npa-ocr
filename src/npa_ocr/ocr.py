@@ -827,7 +827,7 @@ def run_tatr_tables(
         if cell_text_fn is not None:
             texts, low_cells = _recognize_cells(crop, structure, texts, cell_text_fn)
         cells, n_rows, n_cols = table_structure.build_cells(structure, texts)
-        if not cells:
+        if not cells or not table_structure.is_plausible_table(cells, n_rows, n_cols):
             continue
         for cell in cells:
             cell.low_lines = low_cells.get((cell.row, cell.col), ())

@@ -342,6 +342,41 @@ def build_cells(structure: TableStructure, texts: list[tuple[Box, str]]) -> tupl
     return cells, n_rows, n_cols
 
 
+# Приказ №565 (2026-10-22), реальный документ: TATR (сам детектор регионов,
+# microsoft/table-transformer-detection) с уверенностью 0.862 — выше
+# TATR_REGION_THRESHOLD=0.7 — принял нижнюю часть страницы (конец пункта 3 +
+# строку подписи министра) за таблицу 5x12. Поднять порог детекции не
+# получится надёжно: на другом реальном документе (Постановление №1430)
+# настоящие таблицы встречались со скорами 0.679-0.883 — диапазон
+# пересекается с этим ложным срабатыванием, чистого порога по самой
+# уверенности детектора нет (проверено эмпирически, см. docs/plan.md).
+# Отличие — в структуре итоговой сетки: у настоящей таблицы большинство
+# столбцов заполнено в большинстве строк (данные повторяются по вертикали,
+# измерено на 4 реальных таблицах — 0.812-0.955), а здесь каждый «столбец» —
+# случайный межсловный пробел одной строки текста, заполнен лишь в 1-2
+# строках из 5 (измерено на реальной сетке — 0.417). Порог 0.6 — с запасом
+# между этими двумя группами реальных измерений.
+_TABLE_MIN_AVG_COL_FILL_RATIO = 0.6
+
+
+def is_plausible_table(cells: list[TableCell], n_rows: int, n_cols: int) -> bool:
+    """После сборки сетки (build_cells) решает, похоже ли это на настоящую
+    таблицу, или TATR разбил на псевдо-столбцы обычный абзац текста (см.
+    комментарий у _TABLE_MIN_AVG_COL_FILL_RATIO). Сетки меньше 2x2 слишком
+    малы для этой проверки — не отбраковываются ею (такие случаи — вне
+    текущей проблемы, см. docs/plan.md)."""
+    if n_rows < 2 or n_cols < 2:
+        return True
+    filled_rows_per_col = [0] * n_cols
+    for cell in cells:
+        if not cell.text.strip():
+            continue
+        for c in range(cell.col, min(n_cols, cell.col + cell.col_span)):
+            filled_rows_per_col[c] += 1
+    ratios = [min(1.0, f / n_rows) for f in filled_rows_per_col]
+    return (sum(ratios) / len(ratios)) >= _TABLE_MIN_AVG_COL_FILL_RATIO
+
+
 def _disable_mkldnn_workaround() -> None:
     """MKL-DNN (oneDNN) бэкенд torch на некоторых старых CPU без AVX2 (например,
     Intel Xeon E5-2696 v2, Ivy Bridge, 2013 — подтверждено на реальном сервере)

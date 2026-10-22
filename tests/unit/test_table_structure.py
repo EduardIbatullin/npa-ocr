@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from npa_ocr.ocr_table import TableCell
 from npa_ocr.table_structure import (
     TableStructure,
     build_cells,
     drop_empty_columns,
     drop_empty_rows,
+    is_plausible_table,
     join_fragment_lines,
     merge_header_bands,
 )
@@ -185,3 +187,78 @@ def test_join_fragment_lines_keeps_short_fragment_that_is_not_contained():
         ((55.0, 0.0, 80.0, 30.0), "3", 0.9),
     ]
     assert join_fragment_lines(items) == [("в 3", 0.9)]
+
+
+def _cells(rows: int, cols: int, text_by_pos: dict[tuple[int, int], str]) -> list[TableCell]:
+    return [
+        TableCell(row=r, col=c, row_span=1, col_span=1, text=text_by_pos.get((r, c), ""))
+        for r in range(rows)
+        for c in range(cols)
+    ]
+
+
+def test_is_plausible_table_rejects_real_false_positive_from_tatr_detection():
+    # Реальная сетка с развёрнутого сервера (Приказ Минприроды №565, стр. 1,
+    # bbox=[165,1733,1607,2150]) — TATR (table-transformer-detection) дал
+    # score=0.862 на нижней части страницы (конец пункта 3 + строка подписи
+    # министра), приняв её за таблицу 5x12. На самом деле «столбцы» —
+    # случайные межсловные пробелы одной строки текста (см. docs/plan.md).
+    text_by_pos = {
+        (0, 0): "(зарегистрирован", (0, 2): "Министерством", (0, 4): "юстициИ",
+        (0, 7): "Российской", (0, 11): "Федерации",
+        (1, 0): "28 января 2021 Г.", (1, 1): "регистрационный", (1, 2): "$^$", (1, 3): "62264).",
+        (2, 0): "3 Настоящий", (2, 1): "приказ", (2, 2): "вступает", (2, 3): "B", (2, 4): "силу",
+        (2, 5): "C", (2, 6): "1", (2, 7): "apra", (2, 8): "2024", (2, 9): "г.", (2, 11): "действует",
+        (3, 0): "B течение шести лет.",
+        (4, 0): "Министр", (4, 11): "A.A. Козлов",
+    }
+    cells = _cells(5, 12, text_by_pos)
+    assert is_plausible_table(cells, 5, 12) is False
+
+
+def test_is_plausible_table_accepts_real_genuine_table():
+    # Реальная сетка с того же сервера (Постановление №1430, стр. 11,
+    # bbox=[193,871,1455,1363]) — настоящая таблица нормативов 6x6, TATR
+    # нашёл её с score=0.996. Объединённые ячейки шапки учтены col_span=5/
+    # row_span=2, как их фактически строит build_cells.
+    cells = [
+        TableCell(row=0, col=0, row_span=2, col_span=1, text="Категории\nВОДНЫХ\nобъектов"),
+        TableCell(row=0, col=1, row_span=1, col_span=5, text="Технологические пс\nзагряз"),
+        TableCell(row=1, col=1, row_span=1, col_span=1, text="взвешенные\nвещества"),
+        TableCell(row=1, col=2, row_span=1, col_span=1, text="нефтепродукты"),
+        TableCell(row=1, col=3, row_span=1, col_span=1, text=""),
+        TableCell(row=1, col=4, row_span=1, col_span=1, text="БПК5"),
+        TableCell(row=1, col=5, row_span=1, col_span=1, text="фосфатов"),
+        TableCell(row=2, col=0, row_span=1, col_span=1, text="A"),
+        TableCell(row=2, col=1, row_span=1, col_span=1, text="5"),
+        TableCell(row=2, col=2, row_span=1, col_span=1, text="0,3"),
+        TableCell(row=2, col=3, row_span=1, col_span=1, text="30"),
+        TableCell(row=2, col=4, row_span=1, col_span=1, text="5"),
+        TableCell(row=2, col=5, row_span=1, col_span=1, text="0,5"),
+        TableCell(row=3, col=0, row_span=1, col_span=1, text="B"),
+        TableCell(row=3, col=1, row_span=1, col_span=1, text="15"),
+        TableCell(row=3, col=2, row_span=1, col_span=1, text="1"),
+        TableCell(row=3, col=3, row_span=1, col_span=1, text="50*"),
+        TableCell(row=3, col=4, row_span=1, col_span=1, text="10"),
+        TableCell(row=3, col=5, row_span=1, col_span=1, text="1"),
+        TableCell(row=4, col=0, row_span=1, col_span=1, text="B"),
+        TableCell(row=4, col=1, row_span=1, col_span=1, text="15"),
+        TableCell(row=4, col=2, row_span=1, col_span=1, text=""),
+        TableCell(row=4, col=3, row_span=1, col_span=1, text="60"),
+        TableCell(row=4, col=4, row_span=1, col_span=1, text="12"),
+        TableCell(row=4, col=5, row_span=1, col_span=1, text="1"),
+        TableCell(row=5, col=0, row_span=1, col_span=1, text="Γ"),
+        TableCell(row=5, col=1, row_span=1, col_span=1, text="15"),
+        TableCell(row=5, col=2, row_span=1, col_span=1, text=""),
+        TableCell(row=5, col=3, row_span=1, col_span=1, text="60"),
+        TableCell(row=5, col=4, row_span=1, col_span=1, text="12"),
+        TableCell(row=5, col=5, row_span=1, col_span=1, text="5"),
+    ]
+    assert is_plausible_table(cells, 6, 6) is True
+
+
+def test_is_plausible_table_does_not_reject_small_grids():
+    # Сетки меньше 2x2 (например, случайно принятый за «таблицу» штамп
+    # нумерации страницы, см. docs/plan.md) — вне охвата этой проверки.
+    cells = [TableCell(row=0, col=0, row_span=1, col_span=1, text="678924")]
+    assert is_plausible_table(cells, 1, 1) is True

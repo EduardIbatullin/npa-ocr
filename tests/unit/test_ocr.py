@@ -821,12 +821,14 @@ def test_run_tatr_tables_builds_block_with_offset_and_text_from_ocr(tmp_path: Pa
         )
 
     def fake_text(_crop_path):
+        # Третья ячейка (1,0) — чтобы сетка 2x2 прошла is_plausible_table
+        # (не часть проверяемого поведения этого теста — offset/dropped_columns).
         return {
             "table_res_list": [
                 {
                     "table_ocr_pred": {
-                        "rec_boxes": [[10, 10, 140, 40], [160, 110, 290, 140]],
-                        "rec_texts": ["Ячейка-1", "Ячейка-2"],
+                        "rec_boxes": [[10, 10, 140, 40], [160, 110, 290, 140], [10, 110, 140, 140]],
+                        "rec_texts": ["Ячейка-1", "Ячейка-2", "Ячейка-3"],
                     }
                 }
             ]
