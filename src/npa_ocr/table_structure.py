@@ -27,11 +27,42 @@ TATR_MODEL_NAME = "microsoft/table-transformer-structure-recognition-v1.1-all"
 # документов (PubTables-1M, detection split) — это её прямое назначение.
 TATR_DETECTION_MODEL_NAME = "microsoft/table-transformer-detection"
 TATR_TABLE_LABEL = 0
+# Метка detect_table_regions (модель TATR_DETECTION_MODEL_NAME) — своё
+# пространство меток, отдельное от TATR_COLUMN_LABEL ниже (та — для
+# detect_structure, модель TATR_MODEL_NAME); то, что оба равны 1, совпадение,
+# не связь. См. docs/plan.md «Приказ №191 — TATR путает непривычный layout
+# с повёрнутой таблицей» (2026-10-23): TATR_DETECTION_MODEL_NAME обучена на
+# PubTables-1M (таблицы из научных статей, где «table rotated» — реально
+# развёрнутая на 90° широкая таблица). На многостраничных таблицах НПА без
+# подписи, залитых на весь лист без полей (обычное дело для страниц-
+# продолжений), детектор на реальном документе систематически путает этот
+# layout с «table rotated» — с уверенностью 0.93-0.999, т.е. таблицу он
+# видит прекрасно, ошибается только в выборе из двух классов. Простого
+# геометрического признака, отличающего верные и ошибочные случаи,
+# эмпирически не нашлось (проверено: отступ от края листа, соотношение
+# сторон региона — не предсказывают). Наш пайплайн не делает коррекцию
+# поворота ни для одного из классов, так что оба трактуются одинаково —
+# детектор не умеет надёжно их различать на этом типе документов, а для
+# НЕ повёрнутых (подавляющее большинство реальных случаев) разница не нужна.
+# Если область и правда повёрнута — текст в ней не читается ни TATR
+# (структура), ни Tesseract/RapidOCR (текст), сетка выйдет почти пустой и
+# отсеется тем же is_plausible_table, что и раньше — не хуже, чем сейчас.
+TATR_TABLE_ROTATED_LABEL = 1
 TATR_COLUMN_LABEL = 1
 TATR_ROW_LABEL = 2
 TATR_HEADER_LABEL = 3
 TATR_SPANNING_LABEL = 5
 TATR_REGION_THRESHOLD = 0.7
+# Резервный порог — см. docs/plan.md, тот же раздел, что у
+# TATR_TABLE_ROTATED_LABEL: на части страниц того же документа (не только
+# из-за выбора класса) уверенность детектора по ОБОИМ классам нестабильна
+# (0.5-0.65) на этом нетипичном для PubTables-1M layout. Применяется только
+# если на обычном пороге не нашлось ни одной области (см.
+# detect_table_regions) — не на каждой странице, лишний проход
+# постобработки (не повторный forward pass модели) дешёвый. Ложные
+# срабатывания на этом пороге отсеивает is_plausible_table после сборки
+# сетки — тот же защитный механизм, что уже проверен на Приказе №565.
+TATR_REGION_FALLBACK_THRESHOLD = 0.3
 TATR_STRUCTURE_THRESHOLD = 0.5
 
 
@@ -415,15 +446,27 @@ def load_tatr_detector():
     return model, proc
 
 
-def _detect_with(loader, img, labels: set[int], threshold: float) -> list[Box]:
+def _run_detector(loader, img):
+    """Один forward pass модели (дорогая часть) — отдельно от постобработки
+    (дешёвая, можно повторить с другим порогом без повторного инференса, см.
+    detect_table_regions)."""
     import torch
 
     model, proc = loader()
     inputs = proc(images=img, return_tensors="pt")
     with torch.no_grad():
         out = model(**inputs)
+    return proc, out
+
+
+def _postprocess(proc, out, img, labels: set[int], threshold: float) -> list[Box]:
     res = proc.post_process_object_detection(out, threshold=threshold, target_sizes=[img.size[::-1]])[0]
     return [tuple(b.tolist()) for b, lab in zip(res["boxes"], res["labels"]) if int(lab) in labels]
+
+
+def _detect_with(loader, img, labels: set[int], threshold: float) -> list[Box]:
+    proc, out = _run_detector(loader, img)
+    return _postprocess(proc, out, img, labels, threshold)
 
 
 def _detect(img, labels: set[int], threshold: float) -> list[Box]:
@@ -431,7 +474,18 @@ def _detect(img, labels: set[int], threshold: float) -> list[Box]:
 
 
 def detect_table_regions(img) -> list[Box]:
-    return _detect_with(load_tatr_detector, img, {TATR_TABLE_LABEL}, TATR_REGION_THRESHOLD)
+    """Области таблиц на целой странице. Обе метки TATR_DETECTION_MODEL_NAME
+    («table» и «table rotated») принимаются как равнозначные — см. комментарий
+    у TATR_TABLE_ROTATED_LABEL. Если на обычном пороге не нашлось ни одной
+    области, один и тот же forward pass переиспользуется для повторной
+    постобработки на TATR_REGION_FALLBACK_THRESHOLD (см. комментарий там же) —
+    без повторного инференса модели."""
+    proc, out = _run_detector(load_tatr_detector, img)
+    labels = {TATR_TABLE_LABEL, TATR_TABLE_ROTATED_LABEL}
+    found = _postprocess(proc, out, img, labels, TATR_REGION_THRESHOLD)
+    if found:
+        return found
+    return _postprocess(proc, out, img, labels, TATR_REGION_FALLBACK_THRESHOLD)
 
 
 def detect_structure(img) -> TableStructure:
