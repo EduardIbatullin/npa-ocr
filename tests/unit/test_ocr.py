@@ -25,6 +25,7 @@ from npa_ocr.ocr import (
     run_tesseract_text,
 )
 from npa_ocr.ocr import _recover_bottom_gap_text
+from npa_ocr.ocr import _best_img2table_match, _table_cells_from_img2table
 from npa_ocr.ocr_table import TableCell
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ocr_tables"
@@ -925,7 +926,8 @@ def test_run_tatr_tables_builds_block_with_offset_and_text_from_ocr(tmp_path: Pa
         }
 
     blocks = run_tatr_tables(
-        img_path, fake_text, region_fn=fake_region, structure_fn=fake_structure
+        img_path, fake_text, region_fn=fake_region, structure_fn=fake_structure,
+        img2table_fallback_fn=lambda _p: [],
     )
     assert len(blocks) == 1
     b = blocks[0]
@@ -964,6 +966,7 @@ def test_run_tatr_tables_drops_duplicate_texts_from_overlapping_table_entries(tm
         structure_fn=lambda _crop: TableStructure(
             rows=[(0.0, 0.0, 300.0, 100.0)], cols=[(0.0, 0.0, 150.0, 100.0), (150.0, 0.0, 300.0, 100.0)], spans=[]
         ),
+        img2table_fallback_fn=lambda _p: [],
     )
     assert blocks[0].cells[0].text == "Ячейка"  # не "Ячейка Ячейка"
 
@@ -1004,6 +1007,7 @@ def test_run_tatr_tables_recognizes_each_cell_separately_when_cell_fn_given(tmp_
             cols=[(0.0, 0.0, 150.0, 100.0), (150.0, 0.0, 300.0, 100.0)],
             spans=[],
         ),
+        img2table_fallback_fn=lambda _p: [],
     )
     assert seen  # каждая ячейка с текстом распознана отдельным кропом
     assert blocks[0].cells[0].text == "ЯЧ"
@@ -1044,6 +1048,7 @@ def test_run_tatr_tables_downscales_large_crop_for_text_and_restores_coordinates
         structure_fn=lambda _crop: TableStructure(
             rows=[(0.0, 0.0, 4000.0, 4000.0)], cols=[(0.0, 0.0, 4000.0, 4000.0)], spans=[]
         ),
+        img2table_fallback_fn=lambda _p: [],
     )
     assert max(seen["size"]) <= TEXT_PREDICT_MAX_SIDE
 
@@ -1072,6 +1077,7 @@ def test_run_tatr_tables_flags_low_confidence_cell_and_docx_highlights_it(tmp_pa
             cols=[(0.0, 0.0, 150.0, 100.0), (150.0, 0.0, 300.0, 100.0)],
             spans=[],
         ),
+        img2table_fallback_fn=lambda _p: [],
     )
     by_pos = {(c.row, c.col): c for c in blocks[0].cells}
     assert by_pos[(0, 0)].low_lines == (True,)
@@ -1216,3 +1222,195 @@ def test_lazy_engine_loads_once_and_reloads_after_release():
     engine.release()
     assert engine(1) == 2
     assert len(created) == 2
+
+
+class _FakeI2TBBox:
+    def __init__(self, x1, y1, x2, y2):
+        self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
+
+
+class _FakeI2TCell:
+    def __init__(self, bbox, value):
+        self.bbox = bbox
+        self.value = value
+
+
+class _FakeI2TTable:
+    def __init__(self, content):
+        self.content = content
+
+
+def test_table_cells_from_img2table_builds_flat_grid_without_merges():
+    content = {
+        0: [_FakeI2TCell(_FakeI2TBBox(0, 0, 50, 20), "A"), _FakeI2TCell(_FakeI2TBBox(50, 0, 100, 20), "B")],
+        1: [_FakeI2TCell(_FakeI2TBBox(0, 20, 50, 40), "C"), _FakeI2TCell(_FakeI2TBBox(50, 20, 100, 40), None)],
+    }
+    cells, n_rows, n_cols = _table_cells_from_img2table(_FakeI2TTable(content))
+    assert (n_rows, n_cols) == (2, 2)
+    by_pos = {(c.row, c.col): c for c in cells}
+    assert by_pos[(0, 0)].text == "A" and by_pos[(0, 0)].row_span == by_pos[(0, 0)].col_span == 1
+    assert by_pos[(1, 0)].text == "C"
+    assert by_pos[(1, 1)].text == ""  # None -> пустая строка, не "None"
+
+
+def test_table_cells_from_img2table_merges_repeated_bbox_into_span():
+    # Объединённая по вертикали ячейка (img2table повторяет один и тот же bbox
+    # в обеих строках, см. _table_cells_from_img2table) должна стать одной
+    # TableCell с row_span=2, а не двумя отдельными ячейками с одинаковым текстом.
+    merged_bbox = _FakeI2TBBox(0, 0, 50, 40)
+    content = {
+        0: [_FakeI2TCell(merged_bbox, "Merged"), _FakeI2TCell(_FakeI2TBBox(50, 0, 100, 20), "B")],
+        1: [_FakeI2TCell(merged_bbox, "Merged"), _FakeI2TCell(_FakeI2TBBox(50, 20, 100, 40), "D")],
+    }
+    cells, n_rows, n_cols = _table_cells_from_img2table(_FakeI2TTable(content))
+    assert (n_rows, n_cols) == (2, 2)
+    assert len(cells) == 3  # не 4 — объединённая ячейка посчитана один раз
+    merged = next(c for c in cells if c.text == "Merged")
+    assert (merged.row, merged.col, merged.row_span, merged.col_span) == (0, 0, 2, 1)
+
+
+def test_best_img2table_match_picks_candidate_with_largest_vertical_overlap():
+    candidates = [
+        ((0.0, 90.0, 100.0, 310.0), [], 1, 1),  # почти полностью перекрывает [100,300]
+        ((0.0, 500.0, 100.0, 520.0), [], 1, 1),  # не перекрывает вовсе
+    ]
+    match = _best_img2table_match(100.0, 300.0, candidates)
+    assert match is not None
+    assert match[0] == (0.0, 90.0, 100.0, 310.0)
+
+
+def test_best_img2table_match_returns_none_below_overlap_threshold():
+    # Перекрытие слишком маленькое относительно высоты кандидата — не та же таблица.
+    candidates = [((0.0, 295.0, 100.0, 400.0), [], 1, 1)]  # overlap=5 из высоты кандидата 105
+    assert _best_img2table_match(100.0, 300.0, candidates) is None
+
+
+def test_run_tatr_tables_uses_img2table_fallback_when_region_is_clipped(tmp_path: Path):
+    from PIL import Image
+
+    from npa_ocr.ocr import run_tatr_tables
+    from npa_ocr.table_structure import TableStructure
+
+    img_path = tmp_path / "page.png"
+    Image.new("RGB", (1000, 600), "white").save(img_path)
+
+    def fake_text(_crop_path):
+        # два слова (второй столбец — иначе сетка схлопывается до 1x1 и
+        # отбраковывается is_plausible_table, см. docs/plan.md); вместе занимают
+        # только левую часть кропа — итоговый bbox TATR узкий, правый отступ от
+        # ширины страницы (1000px) превышает порог 0.20
+        return {
+            "table_res_list": [
+                {
+                    "table_ocr_pred": {
+                        "rec_boxes": [[0, 10, 200, 40], [220, 10, 420, 40]],
+                        "rec_texts": ["Узко", "Текст"],
+                    }
+                }
+            ]
+        }
+
+    wide_candidate = (
+        (50.0, 90.0, 950.0, 310.0),
+        [TableCell(row=0, col=0, row_span=1, col_span=1, text="Широкая таблица")],
+        1,
+        1,
+    )
+
+    blocks = run_tatr_tables(
+        img_path,
+        fake_text,
+        region_fn=lambda _img: [(100.0, 100.0, 500.0, 300.0)],
+        structure_fn=lambda _crop: TableStructure(
+            rows=[(0.0, 0.0, 440.0, 100.0)], cols=[(0.0, 0.0, 210.0, 100.0), (210.0, 0.0, 440.0, 100.0)], spans=[]
+        ),
+        img2table_fallback_fn=lambda _p: [wide_candidate],
+    )
+    assert len(blocks) == 1
+    assert blocks[0].bbox == (50.0, 90.0, 950.0, 310.0)
+    assert blocks[0].cells[0].text == "Широкая таблица"
+    assert blocks[0].dropped_columns == 0
+
+
+def test_run_tatr_tables_keeps_tatr_result_when_img2table_candidate_is_not_wider(tmp_path: Path):
+    from PIL import Image
+
+    from npa_ocr.ocr import run_tatr_tables
+    from npa_ocr.table_structure import TableStructure
+
+    img_path = tmp_path / "page.png"
+    Image.new("RGB", (1000, 600), "white").save(img_path)
+
+    def fake_text(_crop_path):
+        return {
+            "table_res_list": [
+                {
+                    "table_ocr_pred": {
+                        "rec_boxes": [[0, 10, 200, 40], [220, 10, 420, 40]],
+                        "rec_texts": ["Узко", "Текст"],
+                    }
+                }
+            ]
+        }
+
+    narrow_candidate = (
+        (80.0, 90.0, 400.0, 310.0),  # уже, чем результат TATR — не должен заменить
+        [TableCell(row=0, col=0, row_span=1, col_span=1, text="Ещё уже")],
+        1,
+        1,
+    )
+
+    blocks = run_tatr_tables(
+        img_path,
+        fake_text,
+        region_fn=lambda _img: [(100.0, 100.0, 500.0, 300.0)],
+        structure_fn=lambda _crop: TableStructure(
+            rows=[(0.0, 0.0, 440.0, 100.0)], cols=[(0.0, 0.0, 210.0, 100.0), (210.0, 0.0, 440.0, 100.0)], spans=[]
+        ),
+        img2table_fallback_fn=lambda _p: [narrow_candidate],
+    )
+    assert len(blocks) == 1
+    assert blocks[0].cells[0].text == "Узко"  # исходный результат TATR, не заменён
+
+
+def test_run_tatr_tables_does_not_call_img2table_fallback_when_region_is_not_clipped(tmp_path: Path):
+    from PIL import Image
+
+    from npa_ocr.ocr import run_tatr_tables
+    from npa_ocr.table_structure import TableStructure
+
+    img_path = tmp_path / "page.png"
+    # Узкая страница — тот же bbox, что и выше (bx2=500), занимает почти всю
+    # её ширину (520px), правый отступ 20/520≈0.038 — меньше порога 0.20:
+    # fallback вызываться не должен вообще.
+    Image.new("RGB", (520, 600), "white").save(img_path)
+
+    def fake_text(_crop_path):
+        return {
+            "table_res_list": [
+                {
+                    "table_ocr_pred": {
+                        "rec_boxes": [[0, 10, 200, 40], [220, 10, 420, 40]],
+                        "rec_texts": ["Широко", "Текст"],
+                    }
+                }
+            ]
+        }
+
+    calls: list[Path] = []
+
+    def tracking_fallback(path):
+        calls.append(path)
+        return []
+
+    blocks = run_tatr_tables(
+        img_path,
+        fake_text,
+        region_fn=lambda _img: [(100.0, 100.0, 500.0, 300.0)],
+        structure_fn=lambda _crop: TableStructure(
+            rows=[(0.0, 0.0, 440.0, 100.0)], cols=[(0.0, 0.0, 210.0, 100.0), (210.0, 0.0, 440.0, 100.0)], spans=[]
+        ),
+        img2table_fallback_fn=tracking_fallback,
+    )
+    assert len(blocks) == 1  # таблица принята и без fallback — регион не узкий
+    assert calls == []  # fallback не вызван — регион не выглядит обрезанным

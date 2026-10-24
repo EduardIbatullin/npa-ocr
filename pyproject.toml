@@ -35,6 +35,7 @@ models = [
     "timm",
     "rapidocr>=3.10",  # текст в ячейках таблиц (_default_cell_text_fn), см. ocr.py
     "onnxruntime",
+    "img2table>=2.0",  # cross-check для узких регионов TATR, см. ocr.py:_img2table_tables_for_page
 ]
 # HTTP API (npa_ocr.server) — асинхронные задания поверх CLI, см. README, «HTTP API».
 # Отдельный extra от models: сервис запускает CLI подпроцессом (self-exec, см.

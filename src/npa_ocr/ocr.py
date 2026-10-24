@@ -520,6 +520,112 @@ def _recover_mark_region(
 _TABLE_CROP_PADDING = 20  # пикселей при 200 DPI — запас вокруг таблицы при вырезании
 
 
+# Приказ №215 (2026-10-24), реальный документ: регион таблицы, найденный TATR на
+# страницах 3-4, обрезан по правому краю — колонка со значениями нормативов
+# («≤ 7,23» и т.п.) физически не попадает в кроп, OCR её не видит, и таблица
+# всё равно проходит is_plausible_table (см. docs/plan.md, «Сравнение TATR и
+# img2table», 2026-10-24). На «нормальных» документах (191/215/234/235/565) и
+# даже на легитимно широких таблицах без рамок (Постановление №1430, где
+# правый отступ доходит до 0.12-0.17) доля необрезанной ширины справа от
+# принятого региона не превышала 0.17 — у двух реальных обрезанных страниц
+# было 0.23 и 0.43. Порог 0.20 — с запасом между этими группами.
+_IMG2TABLE_RIGHT_MARGIN_THRESHOLD = 0.20
+
+# img2table запускается только как cross-check для УЖЕ ПРИНЯТЫХ (is_plausible=True),
+# но подозрительно узких таблиц TATR — не для отклонённых (is_plausible=False).
+# Проверено на реальном документе: на Приказе №215, стр. 1 (блок подписи министра,
+# TATR корректно отклоняет как не-таблицу) img2table нашёл СВОЮ ложную «таблицу» —
+# принял за неё обычный абзац текста постановления. Запуск img2table на каждой
+# отклонённой TATR странице добавил бы новый источник ложных срабатываний без
+# подтверждённой пользы (на реальных отклонённых случаях 1430/710 img2table в
+# подавляющем большинстве тоже не находит ничего полезного) — решили не делать.
+_IMG2TABLE_MIN_Y_OVERLAP_RATIO = 0.3  # доля перекрытия по вертикали, чтобы считать
+# найденную img2table-таблицу тем же объектом, что и регион TATR (см. _best_img2table_match)
+
+
+def _table_cells_from_img2table(table) -> tuple[list[TableCell], int, int]:
+    """Переводит ExtractedTable из img2table в формат проекта (TableCell/n_rows/n_cols).
+    table.content — плотная сетка (OrderedDict[row_idx] -> список ячеек по столбцам),
+    где объединённая по вертикали/горизонтали ячейка повторяется с тем же bbox и тем
+    же текстом в каждой позиции, которую покрывает (проверено на реальном документе,
+    Приказ №215, стр. 3 — проверка эмпирическая, в img2table 2.0.0 нет отдельного
+    row_span/col_span в TableCell). Повторный bbox распознаётся как продолжение той
+    же ячейки и расширяет её row_span/col_span, а не создаёт дубликат."""
+    rows_keys = sorted(table.content.keys())
+    n_rows = len(rows_keys)
+    n_cols = max((len(table.content[r]) for r in rows_keys), default=0)
+    seen: dict[tuple, TableCell] = {}
+    cells: list[TableCell] = []
+    for r_idx, r_key in enumerate(rows_keys):
+        row_cells = table.content[r_key]
+        for c_idx, cell in enumerate(row_cells):
+            if c_idx >= n_cols:
+                continue
+            bbox_key = (cell.bbox.x1, cell.bbox.y1, cell.bbox.x2, cell.bbox.y2)
+            owner = seen.get(bbox_key)
+            if owner is not None:
+                owner.row_span = max(owner.row_span, r_idx - owner.row + 1)
+                owner.col_span = max(owner.col_span, c_idx - owner.col + 1)
+                continue
+            new_cell = TableCell(row=r_idx, col=c_idx, row_span=1, col_span=1, text=(cell.value or "").strip())
+            seen[bbox_key] = new_cell
+            cells.append(new_cell)
+    return cells, n_rows, n_cols
+
+
+def _img2table_tables_for_page(image_path: Path) -> list[tuple[Box, list[TableCell], int, int]]:
+    """Независимый, второй проход поиска таблиц на ВСЕЙ странице через img2table
+    (детектор линий OpenCV + TesseractOCR) — специально не переиспользует узкий
+    кроп TATR: если колонки нет в кропе, смена OCR-движка её не восстановит, нужна
+    своя, независимая детекция границ таблицы на полном изображении страницы.
+    Работает на том же 200 DPI, что и основной пайплайн — проверено отдельно, что
+    img2table находит таблицы на этом DPI (в отличие от 300 DPI, где его детектор
+    линий не находит вообще ничего — см. docs/plan.md). Любая ошибка (библиотека не
+    установлена — extra `models`, либо сбой распознавания) — не фатальна, это
+    необязательный cross-check, а не основной путь."""
+    try:
+        from img2table.document import Image as I2TImage
+        from img2table.ocr import TesseractOCR as I2TTesseractOCR
+    except ImportError:
+        return []
+    try:
+        extracted = I2TImage(src=str(image_path)).extract_tables(
+            ocr=I2TTesseractOCR(n_threads=1, lang="rus"),
+            implicit_rows=True,
+            implicit_columns=True,
+            borderless_tables=True,
+            min_confidence=50,
+        )
+    except Exception as exc:
+        print(f"[img2table] сбой fallback-распознавания {image_path}: {exc}", file=sys.stderr)
+        return []
+    result: list[tuple[Box, list[TableCell], int, int]] = []
+    for t in extracted:
+        cells, n_rows, n_cols = _table_cells_from_img2table(t)
+        if cells and table_structure.is_plausible_table(cells, n_rows, n_cols):
+            result.append(((float(t.bbox.x1), float(t.bbox.y1), float(t.bbox.x2), float(t.bbox.y2)), cells, n_rows, n_cols))
+    return result
+
+
+def _best_img2table_match(
+    by1: float, by2: float, candidates: list[tuple[Box, list[TableCell], int, int]]
+) -> tuple[Box, list[TableCell], int, int] | None:
+    """Среди таблиц, найденных img2table на всей странице, выбирает ту, что по
+    вертикали соответствует региону TATR (та же таблица, не другая на той же
+    странице) — по доле перекрытия относительно более короткой из двух высот."""
+    best = None
+    best_ratio = 0.0
+    for candidate in candidates:
+        cy1, cy2 = candidate[0][1], candidate[0][3]
+        overlap = min(by2, cy2) - max(by1, cy1)
+        span = min(by2 - by1, cy2 - cy1)
+        ratio = overlap / span if span > 0 else 0.0
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best = candidate
+    return best if best_ratio >= _IMG2TABLE_MIN_Y_OVERLAP_RATIO else None
+
+
 LOW_CONFIDENCE_THRESHOLD = 0.8  # уверенность строки распознавания (0–1): ниже — выделяется в DOCX
 
 
@@ -777,6 +883,7 @@ def run_tatr_tables(
     structure_fn: Callable[[Image.Image], TableStructure] | None = None,
     release_structure: Callable[[], None] | None = None,
     release_cells: Callable[[], None] | None = None,
+    img2table_fallback_fn: Callable[[Path], list[tuple[Box, list[TableCell], int, int]]] | None = None,
 ) -> list[TableBlock]:
     """Таблицы страницы: регионы и структура (строки/столбцы/объединения) — TATR;
     текст ячеек — PaddleOCR по вырезанной таблице (text_predict_fn). Каждая таблица
@@ -785,8 +892,13 @@ def run_tatr_tables(
 
     Порядок по этапам: сначала все регионы и текст кропов (text_predict_fn) и структура,
     затем release_structure() — выгрузка PPStructureV3, потом текст ячеек (cell_text_fn)
-    и release_cells(). Так тяжёлые движки не находятся в памяти одновременно."""
+    и release_cells(). Так тяжёлые движки не находятся в памяти одновременно.
+
+    img2table_fallback_fn (по умолчанию _img2table_tables_for_page) — cross-check для
+    принятых, но подозрительно узких таблиц, см. _IMG2TABLE_RIGHT_MARGIN_THRESHOLD."""
     structure_fn = structure_fn or table_structure.detect_structure
+    img2table_fallback_fn = img2table_fallback_fn or _img2table_tables_for_page
+    img2table_candidates: list[tuple[Box, list[TableCell], int, int]] | None = None
 
     with Image.open(image_path) as opened:
         page = opened.convert("RGB")
@@ -841,6 +953,16 @@ def run_tatr_tables(
             by2 = max(b[3] for b in content) + crop_box[1]
         else:
             bx1, by1, bx2, by2 = x1, y1, x2, y2
+
+        right_margin = (page.width - bx2) / page.width if page.width else 0.0
+        if right_margin > _IMG2TABLE_RIGHT_MARGIN_THRESHOLD:
+            if img2table_candidates is None:
+                img2table_candidates = img2table_fallback_fn(image_path)
+            match = _best_img2table_match(by1, by2, img2table_candidates)
+            if match is not None and (match[0][2] - match[0][0]) > (bx2 - bx1):
+                (bx1, by1, bx2, by2), cells, n_rows, n_cols = match
+                dropped_cols = 0
+
         blocks.append(
             TableBlock(
                 y=by1,
