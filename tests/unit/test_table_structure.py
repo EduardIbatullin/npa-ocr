@@ -8,6 +8,7 @@ from npa_ocr.table_structure import (
     build_cells,
     drop_empty_columns,
     drop_empty_rows,
+    filter_false_positive_spans,
     is_plausible_table,
     join_fragment_lines,
     merge_header_bands,
@@ -55,6 +56,49 @@ def test_drop_empty_rows_removes_rows_without_text():
     texts = [((10, 10, 90, 40), "a")]
     fixed = drop_empty_rows(s, texts)
     assert len(fixed.rows) == 1
+
+
+def _grid_3x2():
+    rows = [(0, 0, 200, 50), (0, 50, 200, 100), (0, 100, 200, 150)]
+    cols = [(0, 0, 100, 150), (100, 0, 200, 150)]
+    return TableStructure(rows=rows, cols=cols, spans=[])
+
+
+def test_filter_false_positive_spans_keeps_genuine_span_with_one_value():
+    """Приказ №191 (2026-10-24): настоящая объединённая ячейка несёт одно
+    значение (текст есть только в одной из охватываемых позиций)."""
+    s = _grid_3x2()
+    span = (0, 0, 100, 150)  # весь столбец 0, три строки
+    s = TableStructure(rows=s.rows, cols=s.cols, spans=[span])
+    texts = [
+        ((10, 10, 90, 40), "общее значение"),  # только в (row0, col0)
+        ((110, 10, 190, 40), "a"),
+        ((110, 60, 190, 90), "b"),
+        ((110, 110, 190, 140), "c"),
+    ]
+    fixed = filter_false_positive_spans(s, texts)
+    assert fixed.spans == [span]
+
+
+def test_filter_false_positive_spans_drops_span_with_independent_values_per_row():
+    """Три разные строки с разными значениями, ошибочно размеченные TATR как
+    одна объединённая ячейка — отбрасываем объединение, текст должен
+    остаться в своих отдельных строках (не склеиваться)."""
+    s = _grid_3x2()
+    span = (0, 0, 100, 150)  # весь столбец 0, три строки — ложное объединение
+    s = TableStructure(rows=s.rows, cols=s.cols, spans=[span])
+    texts = [
+        ((10, 10, 90, 40), "вещество1"),
+        ((10, 60, 90, 90), "вещество2"),
+        ((10, 110, 90, 140), "вещество3"),
+    ]
+    fixed = filter_false_positive_spans(s, texts)
+    assert fixed.spans == []
+    cells, n_rows, n_cols = build_cells(fixed, texts)
+    by_pos = {(c.row, c.col): c.text for c in cells}
+    assert by_pos[(0, 0)] == "вещество1"
+    assert by_pos[(1, 0)] == "вещество2"
+    assert by_pos[(2, 0)] == "вещество3"
 
 
 def test_merge_header_bands_adds_only_non_overlapping_headers():

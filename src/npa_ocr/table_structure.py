@@ -192,6 +192,49 @@ def _span_range(structure: TableStructure, span: Box) -> tuple[int, int, int, in
     return (min(rows_in), min(cols_in), max(rows_in), max(cols_in))
 
 
+# Приказ №191 (2026-10-24), страницы-продолжения многостраничной таблицы
+# (4, 5, 9, 17 — см. docs/plan.md, «Приказ №191 — пункт 3»): TATR иногда
+# рисует «объединённую ячейку» (label=spanning) там, где на самом деле
+# несколько РАЗНЫХ строк с разными значениями — например, столбец
+# «наименование вещества» для трёх разных загрязняющих веществ был
+# детектором размечен как одна объединённая ячейка на всю высоту трёх строк.
+# Настоящая объединённая ячейка несёт ОДНО значение — OCR относит его текст
+# ровно к одной из охватываемых позиций грид (обычно к первой/верхней).
+# Если независимый текст (посчитанный БЕЗ учёта самого объединения, см.
+# cell_text_boxes) есть больше чем в одной из охватываемых позиций —
+# детектор явно видит несколько разных значений, а не одно общее; значит,
+# объединение ложное, и его стоит отбросить, вернув эти позиции к обычным
+# отдельным ячейкам. Проверено на реальном документе: так отсеивается
+# ложное объединение, склеивавшее «Карбонат натрия...» и «Азота диоксид...»
+# (разные вещества) в одну ячейку, а настоящее объединение («редкоземельных
+# металлов», общее для трёх строк) остаётся нетронутым — там текст есть
+# только в одной из трёх охватываемых позиций.
+_SPAN_MAX_INDEPENDENT_CELLS = 1
+
+
+def filter_false_positive_spans(
+    structure: TableStructure, texts: list[tuple[Box, str]]
+) -> TableStructure:
+    """Отбрасывает ложные объединения ячеек TATR — см. комментарий у
+    _SPAN_MAX_INDEPENDENT_CELLS."""
+    grouped = cell_text_boxes(structure, texts)
+    kept: list[Box] = []
+    for span in structure.spans:
+        r0, c0, r1, c1 = _span_range(structure, span)
+        if r0 < 0:
+            kept.append(span)
+            continue
+        independent = sum(
+            1
+            for r in range(r0, r1 + 1)
+            for c in range(c0, c1 + 1)
+            if grouped.get((r, c))
+        )
+        if independent <= _SPAN_MAX_INDEPENDENT_CELLS:
+            kept.append(span)
+    return TableStructure(rows=structure.rows, cols=structure.cols, spans=kept)
+
+
 def drop_empty_columns(structure: TableStructure, texts: list[tuple[Box, str]]) -> tuple[TableStructure, int]:
     """Столбец без единого текстового блока — артефакт детекции (на стр. 22 и 49
     Приказа №901 TATR выделяет лишний пустой четвёртый столбец). Удаляем его,

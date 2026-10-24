@@ -826,6 +826,7 @@ def run_tatr_tables(
         low_cells: dict[tuple[int, int], tuple[bool, ...]] = {}
         if cell_text_fn is not None:
             texts, low_cells = _recognize_cells(crop, structure, texts, cell_text_fn)
+        structure = table_structure.filter_false_positive_spans(structure, texts)
         cells, n_rows, n_cols = table_structure.build_cells(structure, texts)
         if not cells or not table_structure.is_plausible_table(cells, n_rows, n_cols):
             continue
