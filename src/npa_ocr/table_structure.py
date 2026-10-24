@@ -616,19 +616,57 @@ def _detect(img, labels: set[int], threshold: float) -> list[Box]:
     return _detect_with(load_tatr, img, labels, threshold)
 
 
+def _box_iou(a: Box, b: Box) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _merge_overlapping_table_regions(boxes: list[Box]) -> list[Box]:
+    """На реальном документе (Постановление №1430, стр. 6) DETR-детектор TATR
+    (set-based предсказание, без встроенного NMS в post_process_object_detection)
+    выдал ОДНУ настоящую таблицу как 5 почти идентичных перекрывающихся
+    регионов вместо одного — без слияния это дало бы пятикратное дублирование
+    содержимого таблицы в итоговом docx (каждый регион обрабатывается и
+    вставляется отдельно). Перекрывающиеся области объединяются в одну по их
+    общей (минимальной охватывающей) рамке — тот же приём уже применялся к
+    выходу PaddleOCR (см. _merge_overlapping_regions в ocr.py); здесь —
+    отдельная копия для TATR-пути, чтобы не создавать обратную зависимость
+    table_structure.py -> ocr.py (см. docs/plan.md, 2026-10-24)."""
+    merged = list(boxes)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(merged)):
+            for j in range(i + 1, len(merged)):
+                a, b = merged[i], merged[j]
+                if _box_iou(a, b) > 0:
+                    merged[i] = (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+                    del merged[j]
+                    changed = True
+                    break
+            if changed:
+                break
+    return merged
+
+
 def detect_table_regions(img) -> list[Box]:
     """Области таблиц на целой странице. Обе метки TATR_DETECTION_MODEL_NAME
     («table» и «table rotated») принимаются как равнозначные — см. комментарий
     у TATR_TABLE_ROTATED_LABEL. Если на обычном пороге не нашлось ни одной
     области, один и тот же forward pass переиспользуется для повторной
     постобработки на TATR_REGION_FALLBACK_THRESHOLD (см. комментарий там же) —
-    без повторного инференса модели."""
+    без повторного инференса модели. Перекрывающиеся регионы (одна и та же
+    таблица, найденная детектором несколько раз) сливаются — см.
+    _merge_overlapping_table_regions."""
     proc, out = _run_detector(load_tatr_detector, img)
     labels = {TATR_TABLE_LABEL, TATR_TABLE_ROTATED_LABEL}
     found = _postprocess(proc, out, img, labels, TATR_REGION_THRESHOLD)
-    if found:
-        return found
-    return _postprocess(proc, out, img, labels, TATR_REGION_FALLBACK_THRESHOLD)
+    if not found:
+        found = _postprocess(proc, out, img, labels, TATR_REGION_FALLBACK_THRESHOLD)
+    return _merge_overlapping_table_regions(found)
 
 
 def detect_structure(img) -> TableStructure:

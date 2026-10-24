@@ -14,6 +14,7 @@ from npa_ocr.table_structure import (
     merge_header_bands,
     split_oversized_rows,
 )
+from npa_ocr.table_structure import _merge_overlapping_table_regions
 
 
 def _grid_2x3():
@@ -383,3 +384,35 @@ def test_is_plausible_table_does_not_reject_other_small_grids():
 
     col_cells = [TableCell(row=r, col=0, row_span=1, col_span=1, text=str(r)) for r in range(5)]
     assert is_plausible_table(col_cells, 5, 1) is True
+
+
+def test_merge_overlapping_table_regions_collapses_real_duplicate_detections():
+    # Реальный документ (Постановление №1430, стр. 6): DETR-детектор TATR
+    # выдал одну таблицу как 5 перекрывающихся регионов (см. docs/plan.md,
+    # 2026-10-24) — без слияния это дало бы 5-кратное дублирование таблицы
+    # в итоговом docx. Координаты — реальные, из того прогона.
+    boxes = [
+        (231, 1079, 1380, 1343),
+        (209, 1148, 1371, 1647),
+        (236, 999, 1370, 1190),
+        (234, 992, 1368, 1192),
+        (242, 968, 1370, 1166),
+    ]
+    merged = _merge_overlapping_table_regions(boxes)
+    assert len(merged) == 1
+    x1, y1, x2, y2 = merged[0]
+    assert (x1, y1, x2, y2) == (209, 968, 1380, 1647)  # охватывающая рамка всех пяти
+
+
+def test_merge_overlapping_table_regions_keeps_separate_tables_apart():
+    # Две настоящие разные таблицы на одной странице не должны слипаться,
+    # если они не пересекаются геометрически.
+    boxes = [(10, 10, 100, 100), (200, 200, 300, 300)]
+    merged = _merge_overlapping_table_regions(boxes)
+    assert len(merged) == 2
+    assert set(merged) == set(boxes)
+
+
+def test_merge_overlapping_table_regions_passes_through_single_region():
+    boxes = [(10, 10, 100, 100)]
+    assert _merge_overlapping_table_regions(boxes) == boxes
