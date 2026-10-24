@@ -1201,6 +1201,87 @@ def _resolve_tesseract_cmd() -> str | None:
     return None
 
 
+# Автоматическая сегментация Tesseract (psm=3, используется по умолчанию) иногда
+# вообще не находит текстовый блок, отделённый от основного текста большим пустым
+# полем — например, строку подписи под пунктами приказа. Обнаружено на реальном
+# документе (Приказ Минприроды №215, стр. 1): "Министр ... А.А. Козлов" пропадала
+# из DOCX целиком (не как низкая уверенность — вообще без боксов в сырых данных
+# Tesseract), хотя на соседних документах (Приказ №234, №235) та же строка чуть
+# ближе к основному тексту и распознаётся нормально (confidence 96). Разница —
+# в доле пустого пространства под последним найденным словом.
+_BOTTOM_GAP_RATIO = 0.08  # доля высоты страницы — калибровано на 42 реальных страницах
+# (Приказы №191/215/234/235): у обычных страниц (конец абзаца/таблицы у нижнего
+# поля) разрыв 0.06-0.10, у страницы с пропущенной подписью — 0.16. Порог взят
+# чуть выше шума, чтобы не гонять лишний проход на каждой странице.
+_BOTTOM_GAP_MARGIN_PX = 20  # отступ от последнего найденного слова перед повторным кропом
+_BOTTOM_GAP_MIN_WORD_LEN = 2  # см. _recover_bottom_gap_text
+
+
+def _recover_bottom_gap_text(img: "Image.Image", data: dict) -> None:
+    """Повторный проход (psm=6, «единый блок текста») по нижней полосе страницы,
+    не захваченной основным проходом (psm=3) — см. комментарий у _BOTTOM_GAP_RATIO.
+    Мутирует data на месте, дописывая найденные слова в конец массивов (те же
+    ключи, что у pytesseract.image_to_data).
+
+    Добавление применяется, только если повторный проход нашёл хотя бы одно слово
+    с confidence >= DEFAULT_CONFIDENCE_THRESHOLD и минимум из 2 буквенно-цифровых
+    символов — иначе это не пропущенный текст, а шум скана/росчерк подписи/линия
+    таблицы, которые psm=6 иногда читает как короткое "слово" с обманчиво высокой
+    уверенностью (на реальном примере — росчерк подписи дал "—" с conf=70; на
+    пустой строке таблицы — "О"/"ПО" с conf 19-45). Без этого фильтра почти
+    каждая страница с таблицей у нижнего поля получала бы лишние [нрзб.] там,
+    где реального текста никогда не было (проверено на 42 страницах 4 реальных
+    документов — без фильтра ложно сработало бы 15 из 42, с фильтром — только
+    1 подтверждённый случай). При срабатывании добавляются ВСЕ слова кропа
+    (включая низкую уверенность рядом с найденным словом) — остальной текст
+    области получает обычную подсветку [нрзб.], как и везде в проекте для
+    повреждённых печатью/подписью мест (см. docs/plan.md, «Печать/подпись»)."""
+    import re
+
+    import pytesseract
+
+    bottoms = [
+        data["top"][i] + data["height"][i]
+        for i in range(len(data["text"]))
+        if data["text"][i].strip()
+    ]
+    max_bottom = max(bottoms, default=0)
+    if img.height <= 0:
+        return
+    gap_ratio = (img.height - max_bottom) / img.height
+    crop_y0 = max_bottom + _BOTTOM_GAP_MARGIN_PX
+    if gap_ratio <= _BOTTOM_GAP_RATIO or crop_y0 >= img.height:
+        return
+
+    crop = img.crop((0, crop_y0, img.width, img.height))
+    extra = pytesseract.image_to_data(crop, lang="rus", config="--psm 6", output_type=pytesseract.Output.DICT)
+    has_confident_word = any(
+        extra["text"][i].strip()
+        and extra["conf"][i] >= DEFAULT_CONFIDENCE_THRESHOLD
+        and len(re.sub(r"\W", "", extra["text"][i], flags=re.UNICODE)) >= _BOTTOM_GAP_MIN_WORD_LEN
+        for i in range(len(extra["text"]))
+    )
+    if not has_confident_word:
+        return
+
+    block_offset = (max(data["block_num"], default=0) if data["block_num"] else 0) + 1
+    for i in range(len(extra["text"])):
+        if not extra["text"][i].strip():
+            continue
+        data["level"].append(extra["level"][i])
+        data["page_num"].append(extra["page_num"][i])
+        data["block_num"].append(extra["block_num"][i] + block_offset)
+        data["par_num"].append(extra["par_num"][i])
+        data["line_num"].append(extra["line_num"][i])
+        data["word_num"].append(extra["word_num"][i])
+        data["left"].append(extra["left"][i])
+        data["top"].append(extra["top"][i] + crop_y0)
+        data["width"].append(extra["width"][i])
+        data["height"].append(extra["height"][i])
+        data["conf"].append(extra["conf"][i])
+        data["text"].append(extra["text"][i])
+
+
 def _default_image_data_fn(image_path: Path) -> dict:
     import pytesseract
     from PIL import Image
@@ -1213,7 +1294,9 @@ def _default_image_data_fn(image_path: Path) -> dict:
     # уже ловили на практике (PermissionError при уборке tempfile.TemporaryDirectory).
     with Image.open(image_path) as img:
         img.load()
-        return pytesseract.image_to_data(img, lang="rus", output_type=pytesseract.Output.DICT)
+        data = pytesseract.image_to_data(img, lang="rus", output_type=pytesseract.Output.DICT)
+        _recover_bottom_gap_text(img, data)
+        return data
 
 
 def _default_detect_marks_fn(image_path: Path, low_word_boxes: list[Box]) -> list[mark_detection.Mark]:

@@ -24,6 +24,7 @@ from npa_ocr.ocr import (
     run_paddle_tables,
     run_tesseract_text,
 )
+from npa_ocr.ocr import _recover_bottom_gap_text
 from npa_ocr.ocr_table import TableCell
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ocr_tables"
@@ -387,6 +388,95 @@ def test_run_tesseract_text_without_authority_name_leaves_mark_as_is():
     )
     assert blocks[0].text == "Председатель Правительства"
     assert blocks[0].low_words == (False, True)
+
+
+def _full_page_data(words: list[tuple[str, int, int, int, int, int]]) -> dict:
+    """Как _tesseract_data, но с полным набором ключей pytesseract.image_to_data
+    (level/page_num/word_num) — нужен для _recover_bottom_gap_text, которая
+    дописывает новые слова сразу во все массивы словаря."""
+    data: dict[str, list] = {
+        "level": [],
+        "page_num": [],
+        "block_num": [],
+        "par_num": [],
+        "line_num": [],
+        "word_num": [],
+        "left": [],
+        "top": [],
+        "width": [],
+        "height": [],
+        "conf": [],
+        "text": [],
+    }
+    for text, conf, left, top, width, height in words:
+        data["level"].append(5)
+        data["page_num"].append(1)
+        data["block_num"].append(1)
+        data["par_num"].append(1)
+        data["line_num"].append(1)
+        data["word_num"].append(1)
+        data["left"].append(left)
+        data["top"].append(top)
+        data["width"].append(width)
+        data["height"].append(height)
+        data["conf"].append(conf)
+        data["text"].append(text)
+    return data
+
+
+def test_recover_bottom_gap_text_adds_confident_word_from_bottom_gap(monkeypatch):
+    # Основной проход нашёл текст только до y=100 из 1000 — разрыв 90% высоты,
+    # явно больше порога _BOTTOM_GAP_RATIO. Повторный проход (замоканный)
+    # находит уверенное слово — должно быть дописано со сдвигом Y на отступ кропа
+    # и с block_num, не совпадающим с уже существующими (см. docs/plan.md,
+    # «Министр ... Козлов», Приказ №215).
+    import pytesseract
+
+    data = _full_page_data([("Пункт", 96, 10, 80, 60, 20)])
+    extra = _full_page_data([("Министр", 96, 10, 5, 90, 20), ("x", 10, 110, 5, 10, 20)])
+    monkeypatch.setattr(pytesseract, "image_to_data", lambda *a, **k: extra)
+
+    img = Image.new("L", (1000, 1000), color=255)
+    _recover_bottom_gap_text(img, data)
+
+    assert "Министр" in data["text"]
+    idx = data["text"].index("Министр")
+    assert data["conf"][idx] == 96
+    assert data["top"][idx] > 100  # смещён на высоту уже обработанной части страницы
+    assert data["block_num"][idx] != 1  # не склеится в чужую строку по совпадению ключа
+
+
+def test_recover_bottom_gap_text_ignores_noise_without_confident_word(monkeypatch):
+    # Повторный проход нашёл только мусор: короткий символ без буквенного
+    # содержимого ("—", росчерк подписи) и слово с низкой уверенностью — ни то,
+    # ни другое не проходит фильтр, данные не меняются (иначе почти на каждой
+    # странице с таблицей у нижнего поля появлялись бы лишние [нрзб.]).
+    import pytesseract
+
+    data = _full_page_data([("Пункт", 96, 10, 80, 60, 20)])
+    extra = _full_page_data([("—", 70, 10, 5, 20, 20), ("АБ", 40, 50, 5, 30, 20)])
+    monkeypatch.setattr(pytesseract, "image_to_data", lambda *a, **k: extra)
+    n_before = len(data["text"])
+
+    img = Image.new("L", (1000, 1000), color=255)
+    _recover_bottom_gap_text(img, data)
+
+    assert len(data["text"]) == n_before
+
+
+def test_recover_bottom_gap_text_skips_when_gap_is_small(monkeypatch):
+    # Основной проход уже захватил текст почти до низа страницы — повторный
+    # проход не должен даже запускаться.
+    import pytesseract
+
+    def _should_not_be_called(*_a, **_k):
+        raise AssertionError("не должен вызываться при маленьком разрыве")
+
+    monkeypatch.setattr(pytesseract, "image_to_data", _should_not_be_called)
+    data = _full_page_data([("Пункт", 96, 10, 950, 60, 20)])
+    img = Image.new("L", (1000, 1000), color=255)
+    _recover_bottom_gap_text(img, data)
+    assert data["text"] == ["Пункт"]
 
 
 def test_run_tesseract_text_without_detect_marks_fn_is_unaffected():
