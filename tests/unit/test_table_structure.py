@@ -365,8 +365,21 @@ def test_is_plausible_table_accepts_real_genuine_table():
     assert is_plausible_table(cells, 6, 6) is True
 
 
-def test_is_plausible_table_does_not_reject_small_grids():
-    # Сетки меньше 2x2 (например, случайно принятый за «таблицу» штамп
-    # нумерации страницы, см. docs/plan.md) — вне охвата этой проверки.
+def test_is_plausible_table_rejects_1x1_grid():
+    # Реальные документы (Постановление №1430, стр. 2-4; Постановление №710,
+    # стр. 5): TATR иногда принимает штамп нумерации страницы или случайный
+    # фрагмент обычного абзаца за «таблицу» из одной ячейки — единственная
+    # ячейка никогда не таблица, отбраковывается всегда (2026-10-24).
     cells = [TableCell(row=0, col=0, row_span=1, col_span=1, text="678924")]
-    assert is_plausible_table(cells, 1, 1) is True
+    assert is_plausible_table(cells, 1, 1) is False
+
+
+def test_is_plausible_table_does_not_reject_other_small_grids():
+    # Сетки меньше 2x2, но не 1x1 (одна строка из многих столбцов или один
+    # столбец из многих строк) — по-прежнему вне охвата проверки по
+    # заполненности столбцов, см. docs/plan.md.
+    row_cells = [TableCell(row=0, col=c, row_span=1, col_span=1, text=str(c)) for c in range(5)]
+    assert is_plausible_table(row_cells, 1, 5) is True
+
+    col_cells = [TableCell(row=r, col=0, row_span=1, col_span=1, text=str(r)) for r in range(5)]
+    assert is_plausible_table(col_cells, 5, 1) is True

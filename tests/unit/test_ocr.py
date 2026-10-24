@@ -948,8 +948,13 @@ def test_run_tatr_tables_drops_duplicate_texts_from_overlapping_table_entries(tm
     Image.new("RGB", (600, 600), "white").save(img_path)
 
     def fake_text(_crop_path):
-        # две записи таблиц на одном кропе содержат одну и ту же строку
-        same = {"rec_boxes": [[10, 10, 140, 40]], "rec_texts": ["Ячейка"]}
+        # две записи таблиц на одном кропе содержат одну и ту же строку;
+        # второй столбец с текстом — иначе drop_empty_columns схлопывает
+        # сетку до 1x1 и is_plausible_table её отбраковывает (см. docs/plan.md)
+        same = {
+            "rec_boxes": [[10, 10, 140, 40], [160, 10, 290, 40]],
+            "rec_texts": ["Ячейка", "Вторая"],
+        }
         return {"table_res_list": [{"table_ocr_pred": same}, {"table_ocr_pred": same}]}
 
     blocks = run_tatr_tables(
@@ -979,7 +984,19 @@ def test_run_tatr_tables_recognizes_each_cell_separately_when_cell_fn_given(tmp_
 
     blocks = run_tatr_tables(
         img_path,
-        lambda _p: {"table_res_list": [{"table_ocr_pred": {"rec_boxes": [[10, 10, 90, 40]], "rec_texts": ["x"]}}]},
+        lambda _p: {
+            "table_res_list": [
+                {
+                    "table_ocr_pred": {
+                        # второй столбец с текстом — иначе drop_empty_columns
+                        # схлопывает сетку до 1x1 и is_plausible_table её
+                        # отбраковывает (см. docs/plan.md)
+                        "rec_boxes": [[10, 10, 90, 40], [160, 10, 240, 40]],
+                        "rec_texts": ["x", "y"],
+                    }
+                }
+            ]
+        },
         cell_text_fn=fake_cell_text,
         region_fn=lambda _img: [(100.0, 100.0, 400.0, 300.0)],
         structure_fn=lambda _crop: TableStructure(
