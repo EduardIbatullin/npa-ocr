@@ -322,6 +322,14 @@ def run_tesseract_text(
         word = data["text"][i].strip()
         if not word:
             continue
+        # Тот же словарь известных искажений OCR, что уже применяется к тексту
+        # таблиц (normalize_header_text) — раньше работал только там, хотя те
+        # же классы ошибок (смесь латиницы/кириллицы-двойников, «Γ.» вместо
+        # «г.») встречаются и в обычном тексте страницы (годы в датах,
+        # единицы измерения внутри абзацев). Безопасно по той же причине, что
+        # и в таблицах: ключи — символьные сочетания, которых не бывает в
+        # настоящих русских словах (см. docs/plan.md, 2026-10-24).
+        word = normalize_header_text(word)
         x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
         cx, cy = x + w / 2, y + h / 2
         if _point_in_any_box(cx, cy, table_bboxes):
@@ -570,7 +578,97 @@ def _table_cells_from_img2table(table) -> tuple[list[TableCell], int, int]:
             new_cell = TableCell(row=r_idx, col=c_idx, row_span=1, col_span=1, text=(cell.value or "").strip())
             seen[bbox_key] = new_cell
             cells.append(new_cell)
-    return cells, n_rows, n_cols
+    return _merge_img2table_fragment_rows(cells, n_rows, n_cols)
+
+
+_FRAGMENT_CONTINUATION_START = "([«—–-,;"  # см. _looks_like_fragment_continuation
+
+
+def _looks_like_fragment_continuation(text: str) -> bool:
+    """Первый символ текста говорит, продолжение это или новая сущность —
+    стандартная типографика русских регламентных документов: название
+    вещества/процесса начинается с заглавной буквы, а перенесённое на новую
+    "строку" (на деле — продолжение той же ячейки) уточнение в скобках или
+    продолжение фразы — со строчной буквы или открывающей/продолжающей
+    пунктуации. Проверено на реальном документе (Приказ №215, стр. 4):
+    «Углерода оксид» (новая сущность) → «(углерод окись;» → «углерод
+    моноокись;» → «угарный газ)» (все три — продолжения, строчные/скобка) →
+    «Азота диоксид» (снова ЗАГЛАВНАЯ — новая сущность, НЕ продолжение
+    предыдущей, несмотря на то, что тоже единственная непустая колонка в
+    своей "строке"; без этой проверки обрывок одной ячейки склеивался бы с
+    совершенно другим, следующим по порядку, веществом)."""
+    stripped = text.lstrip()
+    if not stripped:
+        return False
+    first = stripped[0]
+    if first in _FRAGMENT_CONTINUATION_START:
+        return True
+    return first.islower()
+
+
+def _merge_img2table_fragment_rows(
+    cells: list[TableCell], n_rows: int, n_cols: int
+) -> tuple[list[TableCell], int, int]:
+    """Реальный документ (Приказ №215, стр. 3-4): img2table иногда разбивает
+    многострочный текст ОДНОЙ ячейки (перенос строки внутри названия вещества
+    или длинного наименования процесса — без реальной линии-разделителя между
+    строками в самой таблице) на НЕСКОЛЬКО строк таблицы вместо одной
+    многострочной ячейки — раздробление крупной ячейки на мелкие, см.
+    docs/plan.md, 2026-10-24. Высота и Y-зазор между такими строками НЕ
+    отличают обрывок от настоящей новой строки — проверено на реальных
+    координатах img2table: он режет область по обнаруженным текстовым строкам
+    без зазора между ними вообще (gap=0 всегда), а высота фрагмента и
+    настоящей короткой строки совпадают (измерено впрямую, оба ~50-60px).
+
+    Разные колонки одной физической области таблицы дробятся НЕЗАВИСИМО друг
+    от друга и не синхронно — проверено на реальном документе (Приказ №215,
+    стр. 4): в одной "строке" img2table колонка 0 может продолжать длинное
+    название ПРЕДЫДУЩЕГО процесса, а колонка 1 в той же "строке" — начинать
+    СОВСЕМ ДРУГОЕ, новое вещество. Поэтому склейка идёт по каждой колонке
+    отдельно (не по строке целиком): для каждой колонки — своя последовательная
+    цепочка «якорь — его продолжения», независимая от других колонок. Признак
+    продолжения — _looks_like_fragment_continuation (не новая сущность).
+    Строка удаляется из итоговой таблицы, только если ПОСЛЕ такой склейки по
+    всем колонкам в ней вообще не осталось текста (все ячейки влиты выше)."""
+    if n_rows <= 1:
+        return cells, n_rows, n_cols
+
+    by_row: dict[int, dict[int, TableCell]] = {}
+    for cell in cells:
+        by_row.setdefault(cell.row, {})[cell.col] = cell
+
+    for c in range(n_cols):
+        anchor: TableCell | None = None
+        for r in range(n_rows):
+            cell = by_row.get(r, {}).get(c)
+            if cell is None or not cell.text.strip():
+                continue
+            if anchor is not None and _looks_like_fragment_continuation(cell.text):
+                anchor.text = anchor.text + "\n" + cell.text
+                cell.text = ""
+            else:
+                anchor = cell
+
+    absorbed_rows = {
+        r for r in range(n_rows) if not any(cell.text.strip() for cell in by_row.get(r, {}).values())
+    }
+    if not absorbed_rows:
+        return cells, n_rows, n_cols
+
+    remap: dict[int, int] = {}
+    new_idx = 0
+    for old_row in range(n_rows):
+        if old_row in absorbed_rows:
+            continue
+        remap[old_row] = new_idx
+        new_idx += 1
+
+    remaining = [cell for cell in cells if cell.row not in absorbed_rows]
+    for cell in remaining:
+        old_end = cell.row + cell.row_span
+        cell.row_span = max(1, sum(1 for rr in range(cell.row, old_end) if rr not in absorbed_rows))
+        cell.row = remap[cell.row]
+    return remaining, new_idx, n_cols
 
 
 def _img2table_tables_for_page(image_path: Path) -> list[tuple[Box, list[TableCell], int, int]]:

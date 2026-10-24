@@ -25,7 +25,12 @@ from npa_ocr.ocr import (
     run_tesseract_text,
 )
 from npa_ocr.ocr import _recover_bottom_gap_text
-from npa_ocr.ocr import _best_img2table_match, _table_cells_from_img2table
+from npa_ocr.ocr import (
+    _best_img2table_match,
+    _looks_like_fragment_continuation,
+    _merge_img2table_fragment_rows,
+    _table_cells_from_img2table,
+)
 from npa_ocr.ocr_table import TableCell
 
 FIXTURES = Path(__file__).parent / "fixtures" / "ocr_tables"
@@ -375,6 +380,23 @@ def test_run_tesseract_text_does_not_touch_clean_lines_or_unrelated_damage():
     )
     assert blocks[0].text == "Обычный абзац"
     assert blocks[0].low_words == (False, True)
+
+
+def test_run_tesseract_text_applies_known_ocr_corrections_like_table_text():
+    # normalize_header_text (известные искажения OCR — смесь латиницы/кириллицы,
+    # «Γ.» вместо «г.») раньше применялся только к тексту таблиц; те же классы
+    # ошибок встречаются и в обычном тексте страницы (см. docs/plan.md, 2026-10-24).
+    data = _tesseract_data(
+        [
+            ("Cpoк", 95, 10, 10, 100, 20),  # «Cpoк» -> «Срок», тот же словарь, что и у таблиц
+            ("действия", 95, 120, 10, 100, 20),
+            ("до", 95, 230, 10, 50, 20),
+            ("2024", 95, 290, 10, 60, 20),
+            ("Γ.", 95, 360, 10, 40, 20),  # «Γ.» (греческая гамма) -> «г.»
+        ]
+    )
+    blocks = run_tesseract_text(Path("unused.png"), [], image_data_fn=lambda _p: data, confidence_threshold=60)
+    assert blocks[0].text == "Срок действия до 2024 г."
 
 
 def test_run_tesseract_text_without_authority_name_leaves_mark_as_is():
@@ -1243,30 +1265,157 @@ class _FakeI2TTable:
 def test_table_cells_from_img2table_builds_flat_grid_without_merges():
     content = {
         0: [_FakeI2TCell(_FakeI2TBBox(0, 0, 50, 20), "A"), _FakeI2TCell(_FakeI2TBBox(50, 0, 100, 20), "B")],
-        1: [_FakeI2TCell(_FakeI2TBBox(0, 20, 50, 40), "C"), _FakeI2TCell(_FakeI2TBBox(50, 20, 100, 40), None)],
+        # у строки 1 заполнены ОБЕ колонки — однозначно настоящая отдельная
+        # строка, а не обрывок (см. _merge_img2table_fragment_rows: обрывок
+        # имеет ровно одну непустую колонку)
+        1: [_FakeI2TCell(_FakeI2TBBox(0, 20, 50, 40), "C"), _FakeI2TCell(_FakeI2TBBox(50, 20, 100, 40), "E")],
     }
     cells, n_rows, n_cols = _table_cells_from_img2table(_FakeI2TTable(content))
     assert (n_rows, n_cols) == (2, 2)
     by_pos = {(c.row, c.col): c for c in cells}
     assert by_pos[(0, 0)].text == "A" and by_pos[(0, 0)].row_span == by_pos[(0, 0)].col_span == 1
     assert by_pos[(1, 0)].text == "C"
-    assert by_pos[(1, 1)].text == ""  # None -> пустая строка, не "None"
+    assert by_pos[(1, 1)].text == "E"
+
+
+def test_table_cells_from_img2table_treats_none_value_as_empty_string():
+    content = {0: [_FakeI2TCell(_FakeI2TBBox(0, 0, 50, 20), "A"), _FakeI2TCell(_FakeI2TBBox(50, 0, 100, 20), None)]}
+    cells, n_rows, n_cols = _table_cells_from_img2table(_FakeI2TTable(content))
+    by_pos = {(c.row, c.col): c for c in cells}
+    assert by_pos[(0, 1)].text == ""  # None -> пустая строка, не "None"
 
 
 def test_table_cells_from_img2table_merges_repeated_bbox_into_span():
     # Объединённая по вертикали ячейка (img2table повторяет один и тот же bbox
     # в обеих строках, см. _table_cells_from_img2table) должна стать одной
     # TableCell с row_span=2, а не двумя отдельными ячейками с одинаковым текстом.
+    # Строка 1 — ДВЕ новые непустые ячейки (col1, col2), иначе при одной
+    # новой ячейке строку поглотила бы _merge_img2table_fragment_rows
+    # (это проверяется отдельным тестом с реальными данными).
     merged_bbox = _FakeI2TBBox(0, 0, 50, 40)
     content = {
-        0: [_FakeI2TCell(merged_bbox, "Merged"), _FakeI2TCell(_FakeI2TBBox(50, 0, 100, 20), "B")],
-        1: [_FakeI2TCell(merged_bbox, "Merged"), _FakeI2TCell(_FakeI2TBBox(50, 20, 100, 40), "D")],
+        0: [
+            _FakeI2TCell(merged_bbox, "Merged"),
+            _FakeI2TCell(_FakeI2TBBox(50, 0, 100, 20), "B"),
+            _FakeI2TCell(_FakeI2TBBox(100, 0, 150, 20), "X"),
+        ],
+        1: [
+            _FakeI2TCell(merged_bbox, "Merged"),
+            _FakeI2TCell(_FakeI2TBBox(50, 20, 100, 40), "D"),
+            _FakeI2TCell(_FakeI2TBBox(100, 20, 150, 40), "Y"),
+        ],
     }
     cells, n_rows, n_cols = _table_cells_from_img2table(_FakeI2TTable(content))
-    assert (n_rows, n_cols) == (2, 2)
-    assert len(cells) == 3  # не 4 — объединённая ячейка посчитана один раз
+    assert (n_rows, n_cols) == (2, 3)
+    assert len(cells) == 5  # не 6 — объединённая ячейка посчитана один раз
     merged = next(c for c in cells if c.text == "Merged")
     assert (merged.row, merged.col, merged.row_span, merged.col_span) == (0, 0, 2, 1)
+
+
+def test_merge_img2table_fragment_rows_joins_real_split_cell_from_order_215():
+    # Реальные данные (Приказ №215, стр. 4, см. docs/plan.md, 2026-10-24):
+    # img2table разбил ячейку «Углерода оксид (углерод окись; углерод
+    # моноокись; угарный газ)» на 4 отдельные "строки" без реальной линии-
+    # разделителя между ними в самой таблице.
+    cells = [
+        TableCell(row=0, col=0, row_span=1, col_span=1, text="метода осушки газа"),
+        TableCell(row=0, col=1, row_span=1, col_span=1, text="Метан"),
+        TableCell(row=0, col=2, row_span=1, col_span=1, text="< 0,68"),
+        TableCell(row=1, col=0, row_span=1, col_span=1, text=""),
+        TableCell(row=1, col=1, row_span=1, col_span=1, text="Углерода оксид"),
+        TableCell(row=1, col=2, row_span=1, col_span=1, text="< 0,09"),
+        TableCell(row=2, col=0, row_span=1, col_span=1, text=""),
+        TableCell(row=2, col=1, row_span=1, col_span=1, text="(углерод окись;"),
+        TableCell(row=2, col=2, row_span=1, col_span=1, text=""),
+        TableCell(row=3, col=0, row_span=1, col_span=1, text=""),
+        TableCell(row=3, col=1, row_span=1, col_span=1, text="углерод моноокись;"),
+        TableCell(row=3, col=2, row_span=1, col_span=1, text=""),
+        TableCell(row=4, col=0, row_span=1, col_span=1, text=""),
+        TableCell(row=4, col=1, row_span=1, col_span=1, text="угарный газ)"),
+        TableCell(row=4, col=2, row_span=1, col_span=1, text=""),
+        # «Азота диоксид» — НОВОЕ вещество сразу после предыдущего обрывка,
+        # тоже с единственной непустой колонкой и без собственного значения —
+        # ключевая проверка: не должно склеиться с «Углерода оксид» только
+        # из-за совпадения колонки (см. _looks_like_fragment_continuation).
+        TableCell(row=5, col=0, row_span=1, col_span=1, text=""),
+        TableCell(row=5, col=1, row_span=1, col_span=1, text="Азота диоксид"),
+        TableCell(row=5, col=2, row_span=1, col_span=1, text=""),
+        # и у «Азота диоксид» свои собственные обрывки-продолжения
+        TableCell(row=6, col=0, row_span=1, col_span=1, text=""),
+        TableCell(row=6, col=1, row_span=1, col_span=1, text="(двуокись азота;"),
+        TableCell(row=6, col=2, row_span=1, col_span=1, text=""),
+        TableCell(row=7, col=0, row_span=1, col_span=1, text=""),
+        TableCell(row=7, col=1, row_span=1, col_span=1, text="пероксид азота)"),
+        TableCell(row=7, col=2, row_span=1, col_span=1, text=""),
+    ]
+    merged, n_rows, n_cols = _merge_img2table_fragment_rows(cells, n_rows=8, n_cols=3)
+    assert n_rows == 3  # строки 2,3,4 поглощены строкой 1; строки 6,7 поглощены строкой 5
+    assert n_cols == 3
+    by_pos = {(c.row, c.col): c for c in merged}
+    assert by_pos[(0, 1)].text == "Метан"
+    assert by_pos[(1, 1)].text == "Углерода оксид\n(углерод окись;\nуглерод моноокись;\nугарный газ)"
+    assert by_pos[(1, 2)].text == "< 0,09"  # значение рядом не потеряно
+    assert by_pos[(2, 1)].text == "Азота диоксид\n(двуокись азота;\nпероксид азота)"  # не склеилось с «Углерода оксид»
+
+
+def test_merge_img2table_fragment_rows_keeps_real_standalone_rows_separate():
+    # У настоящей отдельной строки, помимо вещества, обычно заполнена и
+    # соседняя колонка (например, значение норматива) — не обрывок.
+    cells = [
+        TableCell(row=0, col=0, row_span=1, col_span=1, text="Процесс"),
+        TableCell(row=0, col=1, row_span=1, col_span=1, text="Метан"),
+        TableCell(row=0, col=2, row_span=1, col_span=1, text="< 1,0"),
+        TableCell(row=1, col=0, row_span=1, col_span=1, text=""),
+        TableCell(row=1, col=1, row_span=1, col_span=1, text="Азота диоксид"),
+        TableCell(row=1, col=2, row_span=1, col_span=1, text="< 2,0"),
+    ]
+    merged, n_rows, n_cols = _merge_img2table_fragment_rows(cells, n_rows=2, n_cols=3)
+    assert n_rows == 2  # ничего не поглощено
+    by_pos = {(c.row, c.col): c for c in merged}
+    assert by_pos[(1, 1)].text == "Азота диоксид"
+    assert by_pos[(1, 2)].text == "< 2,0"
+
+
+def test_merge_img2table_fragment_rows_merges_columns_independently_within_same_row():
+    # Реальный документ (Приказ №215, стр. 4): в одной "строке" колонка 0
+    # продолжает длинное название ПРЕДЫДУЩЕГО процесса, а колонка 1 в ТОЙ ЖЕ
+    # "строке" начинает совсем ДРУГОЕ, новое вещество — обе колонки должны
+    # обрабатываться независимо, не блокируя друг друга.
+    cells = [
+        TableCell(row=0, col=0, row_span=1, col_span=1, text="Подготовка газа\nгорючего"),
+        TableCell(row=0, col=1, row_span=1, col_span=1, text="Азота оксид"),
+        TableCell(row=0, col=2, row_span=1, col_span=1, text=""),
+        TableCell(row=1, col=0, row_span=1, col_span=1, text="природного\nк транспорту"),
+        TableCell(row=1, col=1, row_span=1, col_span=1, text="Метан"),
+        TableCell(row=1, col=2, row_span=1, col_span=1, text="< 0,088"),
+        TableCell(row=2, col=0, row_span=1, col_span=1, text="метода осушки"),
+        TableCell(row=2, col=1, row_span=1, col_span=1, text="Углерода оксид"),
+        TableCell(row=2, col=2, row_span=1, col_span=1, text="< 0,016"),
+    ]
+    merged, n_rows, n_cols = _merge_img2table_fragment_rows(cells, n_rows=3, n_cols=3)
+    assert n_rows == 3  # ни одна строка не удалена — у каждой свой якорь в col1
+    by_pos = {(c.row, c.col): c for c in merged}
+    assert by_pos[(0, 0)].text == "Подготовка газа\nгорючего\nприродного\nк транспорту\nметода осушки"
+    assert by_pos[(1, 0)].text == ""  # поглощено колонкой 0 строки 0
+    assert by_pos[(1, 1)].text == "Метан"  # своя отдельная цепочка по колонке 1
+    assert by_pos[(1, 2)].text == "< 0,088"
+    assert by_pos[(2, 1)].text == "Углерода оксид"
+    assert by_pos[(2, 2)].text == "< 0,016"
+
+
+def test_looks_like_fragment_continuation_distinguishes_new_entity_from_continuation():
+    assert _looks_like_fragment_continuation("(углерод окись;") is True
+    assert _looks_like_fragment_continuation("углерод моноокись;") is True
+    assert _looks_like_fragment_continuation("Азота диоксид") is False
+    assert _looks_like_fragment_continuation("Метан") is False
+    assert _looks_like_fragment_continuation("") is False
+    assert _looks_like_fragment_continuation("   ") is False
+
+
+def test_merge_img2table_fragment_rows_noop_for_single_row_table():
+    cells = [TableCell(row=0, col=0, row_span=1, col_span=1, text="A")]
+    merged, n_rows, n_cols = _merge_img2table_fragment_rows(cells, n_rows=1, n_cols=1)
+    assert (merged, n_rows, n_cols) == (cells, 1, 1)
 
 
 def test_best_img2table_match_picks_candidate_with_largest_vertical_overlap():
