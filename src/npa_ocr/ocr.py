@@ -816,6 +816,7 @@ def run_tatr_tables(
         structure, dropped_cols = table_structure.drop_empty_columns(structure, texts)
         structure = table_structure.expand_rows_to_text(structure, texts)
         structure = table_structure.drop_empty_rows(structure, texts)
+        structure = table_structure.split_oversized_rows(structure, texts)
         pending.append((crop_box, (x1, y1, x2, y2), crop, texts, structure, dropped_cols))
 
     if release_structure is not None:

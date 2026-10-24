@@ -12,6 +12,7 @@ from npa_ocr.table_structure import (
     is_plausible_table,
     join_fragment_lines,
     merge_header_bands,
+    split_oversized_rows,
 )
 
 
@@ -78,6 +79,69 @@ def test_filter_false_positive_spans_keeps_genuine_span_with_one_value():
     ]
     fixed = filter_false_positive_spans(s, texts)
     assert fixed.spans == [span]
+
+
+def _grid_1row_2col(row_height: float = 300):
+    rows = [(0, 0, 300, row_height)]
+    cols = [(0, 0, 150, row_height), (150, 0, 300, row_height)]
+    return TableStructure(rows=rows, cols=cols, spans=[])
+
+
+def test_split_oversized_rows_splits_when_two_columns_agree_on_gap():
+    """Приказ №191, пункт 3 (2026-10-24), страница 15: TATR рисует слишком
+    высокую полосу строки без всякого объединения (span) — две независимые
+    короткие строки с большим разрывом между ними (как два значения
+    «мг/нм³» на реальной странице) должны разъехаться по разным строкам.
+    Разрез подтверждён ДВУМЯ столбцами (вещество + единица измерения) — как
+    на реальном подтверждённом случае, см. _ROW_SPLIT_MIN_COLUMNS."""
+    s = _grid_1row_2col()
+    texts = [
+        ((10, 20, 140, 55), "вещество1"),
+        ((10, 130, 140, 165), "вещество2"),
+        ((160, 20, 290, 55), "мг/нм3"),  # разрыв 75px (>= высоты строки) — новая строка
+        ((160, 130, 290, 165), "мг/нм3"),
+    ]
+    fixed = split_oversized_rows(s, texts)
+    assert len(fixed.rows) == 2
+    cells, n_rows, n_cols = build_cells(fixed, texts)
+    by_pos = {(c.row, c.col): c.text for c in cells}
+    assert by_pos[(0, 0)] == "вещество1"
+    assert by_pos[(1, 0)] == "вещество2"
+    assert by_pos[(0, 1)] == "мг/нм3"
+    assert by_pos[(1, 1)] == "мг/нм3"
+
+
+def test_split_oversized_rows_ignores_gap_confirmed_by_only_one_column():
+    """Регрессия, пойманная на реальном документе: перенос одного длинного
+    значения («Азота оксид (азот (II) оксид; азот монооксид)») на две
+    визуальные строки случайно дал разрыв шире порога ТОЛЬКО в одном
+    столбце (остальные столбцы для этой строки были пустыми) — такой разрыв
+    не должен разбивать строку, иначе значение режется пополам."""
+    s = _grid_1row_2col()
+    texts = [
+        ((160, 20, 290, 55), "Азота оксид (азот"),
+        ((160, 130, 290, 165), "монооксид)"),  # большой разрыв, но столбец только один
+    ]
+    fixed = split_oversized_rows(s, texts)
+    assert len(fixed.rows) == 1
+    cells, n_rows, n_cols = build_cells(fixed, texts)
+    by_pos = {(c.row, c.col): c.text for c in cells}
+    assert by_pos[(0, 1)] == "Азота оксид (азот монооксид)"
+
+
+def test_split_oversized_rows_keeps_single_wrapped_value_intact():
+    """Обычный перенос длинного значения на несколько строк (малый разрыв
+    между строками одного и того же значения) не должен разбиваться."""
+    s = _grid_1row_2col()
+    texts = [
+        ((160, 20, 290, 55), "Пыль"),
+        ((160, 60, 290, 95), "неорганическая"),  # разрыв 5px (<< высоты строки)
+    ]
+    fixed = split_oversized_rows(s, texts)
+    assert len(fixed.rows) == 1
+    cells, n_rows, n_cols = build_cells(fixed, texts)
+    by_pos = {(c.row, c.col): c.text for c in cells}
+    assert by_pos[(0, 1)] == "Пыль неорганическая"
 
 
 def test_filter_false_positive_spans_drops_span_with_independent_values_per_row():

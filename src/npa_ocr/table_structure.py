@@ -259,6 +259,98 @@ def drop_empty_rows(structure: TableStructure, texts: list[tuple[Box, str]]) -> 
     return TableStructure(rows=kept, cols=structure.cols, spans=structure.spans)
 
 
+# Приказ №191, пункт 3 (2026-10-24), страница 15: нашлась ещё одна
+# разновидность того же семейства дефектов, которую filter_false_positive_spans
+# не ловит — TATR рисует саму полосу строки СЛИШКОМ ВЫСОКОЙ (не объединённую
+# ячейку, никакого span нет), и она физически вмещает текст двух разных
+# строк. Признак — межстрочный разрыв внутри одного столбца этой строки
+# заметно больше обычного. Порог откалиброван по реальным данным той же
+# страницы: разрыв между двумя независимыми значениями «мг/нм³» — 61px при
+# высоте строки ~35px (отношение ≈1.7), а разрывы между строками ОДНОГО
+# переносимого значения в другой ячейке того же документа — 5-17px при той
+# же высоте (отношение 0.14-0.49) — более чем четырёхкратный запас между
+# группами. 1.0 (разрыв не меньше высоты самой строки) — с запасом между
+# ними, тот же стиль обоснования порога, что у _TABLE_MIN_AVG_COL_FILL_RATIO.
+#
+# Порога по ОДНОМУ столбцу оказалось недостаточно — проверка на реальном
+# документе поймала ложное срабатывание: перенос «Азота оксид (азот (II)
+# оксид; азот монооксид)» на две визуальные строки внутри столбца
+# «наименование» случайно дал разрыв шире порога и значение разрезало
+# пополам, хотя это не две разных строки таблицы. Отличие настоящей границы
+# строки от такого шума — она видна НЕЗАВИСИМО в нескольких столбцах сразу
+# (на подтверждённом реальном случае границу показали одновременно и
+# столбец «вещество», и столбец «единица измерения», с разрывом на той же
+# высоте), а разрыв от случайного переноса — только в одном. Поэтому разрез
+# принимается, только если его подтвердили минимум 2 РАЗНЫХ столбца.
+_ROW_SPLIT_GAP_RATIO = 1.0
+_ROW_SPLIT_MIN_COLUMNS = 2
+# Разрывы в разных столбцах той же строки, указывающие на одну и ту же
+# границу, обычно не совпадают по Y в точности (разная высота строки текста
+# в разных столбцах) — сливаем кандидатов на разрез ближе этого расстояния.
+_ROW_SPLIT_MERGE_TOLERANCE = 20.0
+
+
+def _cluster_line_ranges(boxes: list[Box]) -> list[tuple[float, float]]:
+    """Группирует боксы в строки по вертикальному перекрытию (та же логика,
+    что в join_fragment_lines), возвращает Y-диапазоны строк по возрастанию —
+    см. split_oversized_rows."""
+    lines: list[list[Box]] = []
+    for box in sorted(boxes, key=lambda b: _center(b)[1]):
+        placed = False
+        for line in lines:
+            ref = line[0]
+            overlap = min(ref[3], box[3]) - max(ref[1], box[1])
+            smaller = min(ref[3] - ref[1], box[3] - box[1])
+            if smaller > 0 and overlap / smaller >= 0.5:
+                line.append(box)
+                placed = True
+                break
+        if not placed:
+            lines.append([box])
+    ranges = [(min(b[1] for b in line), max(b[3] for b in line)) for line in lines]
+    return sorted(ranges, key=lambda r: r[0])
+
+
+def split_oversized_rows(structure: TableStructure, texts: list[tuple[Box, str]]) -> TableStructure:
+    """Разбивает строки TATR, фактически вмещающие текст нескольких разных
+    строк, — см. комментарии у _ROW_SPLIT_GAP_RATIO и _ROW_SPLIT_MIN_COLUMNS
+    (разрез нужно подтвердить минимум из двух разных столбцов). Применяется
+    ДО распознавания текста по ячейкам (на первых, нерафинированных texts) —
+    чтобы дальнейшая пересборка (_recognize_cells, filter_false_positive_spans,
+    build_cells) уже работала с исправленными границами строк."""
+    grouped = cell_text_boxes(structure, texts)
+    new_rows: list[Box] = []
+    for i, row in enumerate(structure.rows):
+        candidates: list[tuple[int, float]] = []  # (столбец, середина разрыва)
+        for c in range(len(structure.cols)):
+            blocks = grouped.get((i, c))
+            if not blocks:
+                continue
+            lines = _cluster_line_ranges([box for box, _text in blocks])
+            for (y1a, y2a), (y1b, y2b) in zip(lines, lines[1:]):
+                gap = y1b - y2a
+                height = min(y2a - y1a, y2b - y1b)
+                if height > 0 and gap >= _ROW_SPLIT_GAP_RATIO * height:
+                    candidates.append((c, (y2a + y1b) / 2))
+        groups: list[list[tuple[int, float]]] = []
+        for cand in sorted(candidates, key=lambda cm: cm[1]):
+            if groups and cand[1] - groups[-1][-1][1] <= _ROW_SPLIT_MERGE_TOLERANCE:
+                groups[-1].append(cand)
+            else:
+                groups.append([cand])
+        splits = [
+            sum(m for _c, m in g) / len(g)
+            for g in groups
+            if len({c for c, _m in g}) >= _ROW_SPLIT_MIN_COLUMNS
+        ]
+        if not splits:
+            new_rows.append(row)
+            continue
+        bounds = [row[1], *splits, row[3]]
+        new_rows.extend((row[0], lo, row[2], hi) for lo, hi in zip(bounds, bounds[1:]))
+    return TableStructure(rows=new_rows, cols=structure.cols, spans=structure.spans)
+
+
 FRAGMENT_GAP_RATIO = 0.12  # зазор между фрагментами одного слова — доля высоты строки
 # Доля площади короткого бокса, перекрытая другим боксом той же строки, начиная с
 # которой он считается дублирующей детекцией (не отдельным фрагментом текста).
