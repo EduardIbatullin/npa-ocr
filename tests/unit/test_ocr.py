@@ -550,6 +550,55 @@ def test_run_tesseract_text_escalates_low_confidence_words_under_covering_mark(t
     assert blocks[0].low_words == (False, True, False)
 
 
+def test_run_tesseract_text_rejects_escalation_answer_shorter_than_low_word_count(tmp_path: Path):
+    # Реальный дефект, Приказ №215, стр. 1 (docs/plan.md, «штампы просачиваются
+    # в текст»): bbox метки, найденный по скоплению низкоуверенных слов,
+    # захватил не только штамп, но и край настоящей строки шапки документа
+    # («И ЭКОЛОГИИ» в «МИНИСТЕРСТВО ПРИРОДНЫХ РЕСУРСОВ И ЭКОЛОГИИ») — на эту
+    # область (с двумя низкоуверенными словами) VLM вернула один короткий
+    # неверный ответ «на», которым в итоге была бы заменена часть настоящего
+    # текста. Признак неудачного распознавания — ответ короче, чем слов нужно
+    # заполнить, — для такой метки замена не должна применяться вовсе, слова
+    # остаются как были. Другая метка в том же вызове (с одним низкоуверенным
+    # словом и ровно одним восстановленным) — обычный штатный случай, должна
+    # продолжать работать как раньше (регрессия не должна сломаться вместе с
+    # защитой).
+    image_path = tmp_path / "page.png"
+    Image.new("RGB", (400, 300), "white").save(image_path)
+    data = _tesseract_data_multiline(
+        [
+            ("МИНИСТЕРСТВО", 95, 10, 10, 200, 20, 1),
+            ("И", 10, 220, 10, 20, 20, 1),
+            ("ЭКОЛОГИИ", 10, 250, 10, 100, 20, 1),
+            ("ЗАРЕГИСТРИРОВАНО", 5, 10, 200, 150, 30, 2),
+        ]
+    )
+
+    underfilled_mark = Mark(bbox=(215.0, 5.0, 360.0, 35.0), mark_type="штамп_регистрации", covers_text=True)
+    ok_mark = Mark(bbox=(0.0, 190.0, 200.0, 240.0), mark_type="штамп_регистрации", covers_text=True)
+
+    def fake_detect(_image_path: Path, _low_word_boxes: list) -> list[Mark]:
+        return [underfilled_mark, ok_mark]
+
+    recovered_answers = iter(["на", "ЗАРЕГИСТРИРОВАНО"])
+
+    def fake_recover(_crop_path: Path) -> str:
+        return next(recovered_answers)
+
+    blocks = run_tesseract_text(
+        image_path,
+        [],
+        image_data_fn=lambda _p: data,
+        confidence_threshold=60,
+        detect_marks_fn=fake_detect,
+        recover_covered_text_fn=fake_recover,
+    )
+    assert blocks[0].text == "МИНИСТЕРСТВО И ЭКОЛОГИИ"
+    assert blocks[0].low_words == (False, True, True)
+    assert blocks[1].text == "ЗАРЕГИСТРИРОВАНО"
+    assert blocks[1].low_words == (True,)
+
+
 def test_run_tesseract_text_drops_words_inside_non_covering_e_signature_mark(tmp_path: Path):
     # Пример Постановление №710 (docs/plan.md): штамп электронной подписи внизу
     # страницы — чистый визуальный мусор, не текст документа, не перекрывает

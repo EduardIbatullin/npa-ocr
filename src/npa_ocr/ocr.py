@@ -41,7 +41,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterable, Iterator
 
 import pypdf
 from PIL import Image
@@ -411,7 +411,22 @@ def _apply_mark_escalation(
     возвращённые слова просто по порядку раздаются на все исходные
     низкоуверенные слова внутри метки (по чтению — сверху вниз, слева
     направо), не по строкам — хватит слов или нет, заранее не известно, и
-    это не страшно (см. _consume_escalated_words)."""
+    это не страшно (см. _consume_escalated_words).
+
+    Защита от реального наблюдённого дефекта (Приказ №215, стр. 1, см.
+    docs/plan.md, «штампы просачиваются в текст»): bbox метки, найденный
+    дёшевой эвристикой по низкоуверенным словам, иногда захватывает не
+    только сам штамп, но и край настоящей строки шапки документа — там
+    несколько слов низкоуверенные (задеты штампом). Если на таком кропе VLM
+    вернула МЕНЬШЕ слов, чем нужно заполнить (например, один короткий ответ
+    на область с двумя низкоуверенными словами), — это признак неудачного
+    распознавания (VLM не справилась с кропом, а не подтверждённое
+    восстановление), а не просто «слов не хватило под конец» (это штатный
+    случай — см. _consume_escalated_words). В таком случае замена для ВСЕЙ
+    этой метки не делается вовсе — слова остаются как были (низкая
+    уверенность, видно человеку при проверке), это безопаснее, чем раздать
+    чужой ответ VLM на несколько слов подряд, в том числе на настоящий текст
+    документа."""
     low_word_boxes = [
         (x, y, x + w, y + h) for _, _, words in line_items for (y, x, _word, w, h, low) in words if low
     ]
@@ -438,7 +453,19 @@ def _apply_mark_escalation(
     if escalate_marks and recover_covered_text_fn is not None:
         page_image = Image.open(image_path)
         for i, mark in enumerate(escalate_marks):
-            mark_words[i] = _recover_mark_region(page_image, mark.bbox, recover_covered_text_fn)
+            words = _recover_mark_region(page_image, mark.bbox, recover_covered_text_fn)
+            expected = _count_points_in_box(
+                (_box_center(b) for b in low_word_boxes), mark.bbox
+            )
+            if words is not None and len(words) < expected:
+                print(
+                    f"[ИИ-эскалация] для области {mark.bbox} восстановлено "
+                    f"{len(words)} слов, а низкоуверенных слов в области {expected} — "
+                    "похоже на неудачное распознавание, замена не применяется",
+                    file=sys.stderr,
+                )
+                words = None
+            mark_words[i] = words
     mark_iters = [iter(words) if words else None for words in mark_words]
 
     result = []
@@ -453,6 +480,14 @@ def _apply_mark_escalation(
     return result
 
 
+def _box_center(box: Box) -> tuple[float, float]:
+    return (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+
+
+def _count_points_in_box(points: Iterable[tuple[float, float]], box: Box) -> int:
+    return sum(1 for cx, cy in points if box[0] <= cx <= box[2] and box[1] <= cy <= box[3])
+
+
 def _consume_escalated_words(
     words: list[_WordTuple],
     escalate_marks: list[mark_detection.Mark],
@@ -462,8 +497,9 @@ def _consume_escalated_words(
     заменяются следующим словом из уже восстановленного для этой метки
     текста (единый вызов на всю метку — см. _apply_mark_escalation), пока
     слова не кончатся; если их не хватило или эскалация для метки не
-    удалась — исходное (сырое) слово остаётся как было, не теряем информацию
-    молча. Результат всё равно помечается low=True, см. docstring
+    удалась (включая отказ по _count_points_in_box, см. docstring выше) —
+    исходное (сырое) слово остаётся как было, не теряем информацию молча.
+    Результат всё равно помечается low=True, см. docstring
     run_tesseract_text."""
     result: list[_WordTuple] = []
     for word in words:
