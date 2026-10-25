@@ -1107,6 +1107,30 @@ def run_tatr_tables(
                 dropped_columns=dropped_cols,
             )
         )
+    if not regions:
+        # TATR не нашёл НИ ОДНОГО региона на странице (не просто подозрительно
+        # узкий принятый — см. _IMG2TABLE_RIGHT_MARGIN_THRESHOLD выше) — реальный
+        # случай, Приказ №215, стр. 5 (docs/plan.md, «таблица на последней
+        # странице не находится»): это честный хвост многостраничной таблицы
+        # (4 строки), TATR её вообще не замечает ни на каком безопасном пороге.
+        # Второй, независимый проход по всей странице через img2table — та же
+        # уже проверенная инфраструктура, что и для узких регионов выше, не
+        # новый механизм. Безопасность — не в доверии img2table самому по себе
+        # (у него свои ложные срабатывания, см. Постановление №710), а в том,
+        # что _img2table_tables_for_page уже фильтрует результат через
+        # table_structure.is_plausible_table — тот же порог, что отбрасывает
+        # ложные «таблицы» TATR на обычном тексте. Эта ветка НЕ трогает случай,
+        # когда TATR нашёл регион, но он был отвергнут как неправдоподобный
+        # (regions непустой) — именно такое понижение общего порога TATR уже
+        # проверено и запрещено (см. «таблица на последней странице», риск на
+        # Постановлении №710 стр. 13).
+        if img2table_candidates is None:
+            img2table_candidates = img2table_fallback_fn(image_path)
+        for bbox, cells, n_rows, n_cols in img2table_candidates:
+            blocks.append(
+                TableBlock(y=bbox[1], bbox=bbox, cells=cells, n_rows=n_rows, n_cols=n_cols, dropped_columns=0)
+            )
+
     if release_cells is not None:
         release_cells()
     return blocks

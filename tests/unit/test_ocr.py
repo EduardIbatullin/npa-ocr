@@ -1571,6 +1571,72 @@ def test_run_tatr_tables_keeps_tatr_result_when_img2table_candidate_is_not_wider
     assert blocks[0].cells[0].text == "Узко"  # исходный результат TATR, не заменён
 
 
+def test_run_tatr_tables_falls_back_to_img2table_when_tatr_finds_no_region_at_all(tmp_path: Path):
+    """Реальный случай — Приказ №215, стр. 5 (docs/plan.md, «таблица на последней
+    странице не находится»): честный хвост многостраничной таблицы, TATR не
+    находит там region ни на одном безопасном пороге (`region_fn` возвращает
+    []). В отличие от уже проверенного случая «узкий принятый регион» выше,
+    здесь регионов TATR нет совсем — fallback на img2table по всей странице
+    должен сработать и это единственный источник найденной таблицы."""
+    from PIL import Image
+
+    from npa_ocr.ocr import run_tatr_tables
+
+    img_path = tmp_path / "page.png"
+    Image.new("RGB", (1000, 600), "white").save(img_path)
+
+    candidate = (
+        (50.0, 90.0, 950.0, 310.0),
+        [TableCell(row=0, col=0, row_span=1, col_span=1, text="Хвост таблицы")],
+        1,
+        1,
+    )
+
+    blocks = run_tatr_tables(
+        img_path,
+        lambda _p: {"table_res_list": []},
+        region_fn=lambda _img: [],
+        img2table_fallback_fn=lambda _p: [candidate],
+    )
+    assert len(blocks) == 1
+    assert blocks[0].bbox == (50.0, 90.0, 950.0, 310.0)
+    assert blocks[0].cells[0].text == "Хвост таблицы"
+
+
+def test_run_tatr_tables_does_not_fall_back_to_img2table_when_tatr_region_was_rejected(tmp_path: Path):
+    """Отличает «TATR не нашёл ничего» (fallback выше) от «TATR нашёл регион, но
+    он отвергнут как неправдоподобный» — для второго случая понижение порога
+    уже проверено и признано опасным (Постановление №710, стр. 13: обычный
+    формульный текст даёт ложные «таблицы», см. docs/plan.md, «таблица на
+    последней странице»). region_fn здесь возвращает регион (TATR что-то
+    нашёл), но структура настолько вырождена (1x1 без текста), что
+    is_plausible_table его отбросит — img2table-fallback в этой ветке
+    вызываться не должен вообще."""
+    from PIL import Image
+
+    from npa_ocr.ocr import run_tatr_tables
+    from npa_ocr.table_structure import TableStructure
+
+    img_path = tmp_path / "page.png"
+    Image.new("RGB", (1000, 600), "white").save(img_path)
+
+    calls: list[Path] = []
+
+    def tracking_fallback(path):
+        calls.append(path)
+        return []
+
+    blocks = run_tatr_tables(
+        img_path,
+        lambda _p: {"table_res_list": []},
+        region_fn=lambda _img: [(100.0, 100.0, 500.0, 300.0)],
+        structure_fn=lambda _crop: TableStructure(rows=[], cols=[], spans=[]),
+        img2table_fallback_fn=tracking_fallback,
+    )
+    assert blocks == []
+    assert calls == []  # регион был (не пустой список), просто отвергнут — не тот случай
+
+
 def test_run_tatr_tables_does_not_call_img2table_fallback_when_region_is_not_clipped(tmp_path: Path):
     from PIL import Image
 

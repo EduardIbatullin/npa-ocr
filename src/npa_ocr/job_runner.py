@@ -107,8 +107,18 @@ class Job:
 
 
 def _default_command(pdf_path: Path, docx_path: Path, authority_name: str | None) -> list[str]:
-    """Команда CLI npa-ocr (self-exec, см. докстринг модуля)."""
-    cmd = ["npa-ocr", str(pdf_path), "--out", str(docx_path)]
+    """Команда CLI npa-ocr (self-exec, см. докстринг модуля).
+
+    --ai-escalation включена здесь всегда: защита от замены настоящего текста
+    плохим ответом VLM (счётчик слов на метку, см. docs/plan.md, «штампы
+    просачиваются в текст») уже проверена на реальном документе и безопасна
+    по деградации — эскалация ничего не портит хуже исходного низкоуверенного
+    текста, только иногда не убирает мусор штампа (отдельный, пока открытый
+    дефект). Требует сеть до Ollama на хосте (см. OLLAMA_URL в
+    docker-compose.yml) — без неё classify_mark/recover_covered_text просто
+    логируют ошибку и остаются без эскалации (mark_detection.detect_marks
+    глушит исключения классификации), страница не падает."""
+    cmd = ["npa-ocr", str(pdf_path), "--out", str(docx_path), "--ai-escalation"]
     if authority_name:
         cmd += ["--authority-name", authority_name]
     return cmd
