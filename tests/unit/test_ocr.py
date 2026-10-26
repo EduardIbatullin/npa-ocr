@@ -1678,3 +1678,110 @@ def test_run_tatr_tables_does_not_call_img2table_fallback_when_region_is_not_cli
     )
     assert len(blocks) == 1  # таблица принята и без fallback — регион не узкий
     assert calls == []  # fallback не вызван — регион не выглядит обрезанным
+
+
+# --- Поворот страницы по Tesseract OSD ---
+
+ROTATION_PAGES = Path(__file__).parent / "fixtures" / "vlm_tables"
+
+
+def test_parse_osd_rotation_needs_confidence():
+    from npa_ocr.ocr import parse_osd_rotation
+
+    osd = "Page number: 0\nOrientation in degrees: 270\nRotate: 90\nOrientation confidence: 7.41\n"
+    assert parse_osd_rotation(osd) == 90
+    assert parse_osd_rotation(osd.replace("7.41", "1.20")) == 0  # мало текста — не доверяем
+    assert parse_osd_rotation("") == 0
+
+
+def _blank_scan_pdf(path: Path) -> Path:
+    import fitz
+
+    doc = fitz.open()
+    doc.new_page()  # пустая страница — имитация скана без текстового слоя (595×842 pt, книжная)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def test_ocr_document_rotates_scan_before_tables_and_text(tmp_path: Path):
+    """Альбомная таблица в книжном скане: страница поворачивается до распознавания, и таблицы,
+    и Tesseract получают уже повёрнутое (альбомное) изображение."""
+    pdf_path = _blank_scan_pdf(tmp_path / "scan.pdf")
+    sizes = {}
+
+    def fake_predict(path):
+        with Image.open(path) as img:
+            sizes["tables"] = img.size
+        return _load_simple_table_json()
+
+    def fake_image_data(path):
+        with Image.open(path) as img:
+            sizes["text"] = img.size
+        return _tesseract_data([("Распознано", 90, 10, 5, 100, 20)])
+
+    result = ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        predict_tables_fn=fake_predict,
+        image_data_fn=fake_image_data,
+        orientation_fn=lambda _path: 90,
+        progress_fn=lambda *a: None,
+    )
+    w, h = sizes["text"]
+    assert w > h  # книжная страница стала альбомной
+    assert sizes["tables"] == sizes["text"]
+    assert result.pages[0].page_height == h
+    steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
+    assert "поворот страницы (OSD)" in steps
+
+
+def test_ocr_document_without_auto_rotate_does_not_ask_orientation(tmp_path: Path):
+    pdf_path = _blank_scan_pdf(tmp_path / "scan.pdf")
+
+    def _should_not_be_called(_path):
+        raise AssertionError("auto_rotate=False — OSD не вызывается")
+
+    result = ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        predict_tables_fn=lambda _p: _load_simple_table_json(),
+        image_data_fn=lambda _p: _tesseract_data([("Распознано", 90, 10, 5, 100, 20)]),
+        auto_rotate=False,
+        orientation_fn=_should_not_be_called,
+        progress_fn=lambda *a: None,
+    )
+    assert result.pages[0].ocr_applied is True
+
+
+def _has_tesseract() -> bool:
+    import shutil
+
+    from npa_ocr.ocr import _resolve_tesseract_cmd
+
+    return bool(_resolve_tesseract_cmd() or shutil.which("tesseract"))
+
+
+@pytest.mark.skipif(not _has_tesseract(), reason="нет Tesseract")
+@pytest.mark.parametrize(
+    "key, turned, expected",
+    [
+        ("228_p025", 90, 90),  # альбомная таблица на боку (Приказ №228)
+        ("227_p009", 180, 180),  # перевёрнутая страница (Приказ №227)
+        ("191_p015", 0, 0),  # обычная книжная страница с таблицей
+    ],
+)
+def test_default_orientation_fn_on_real_pages(tmp_path: Path, key: str, turned: int, expected: int):
+    """Страницы спайка npa-vlm-ocr хранятся уже выровненными — возвращаем им исходный поворот
+    скана и проверяем, что OSD находит угол, который его исправляет."""
+    from npa_ocr.ocr import _default_orientation_fn, rotate_page_image
+
+    path = tmp_path / f"{key}.png"
+    with Image.open(ROTATION_PAGES / f"{key}.png") as img:
+        img.rotate(turned, expand=True).save(path)
+    rotation = _default_orientation_fn(path)
+    assert rotation == expected
+    if rotation:
+        rotate_page_image(path, rotation)
+        with Image.open(path) as fixed, Image.open(ROTATION_PAGES / f"{key}.png") as orig:
+            assert fixed.size == orig.size

@@ -1579,6 +1579,47 @@ def _default_image_data_fn(image_path: Path) -> dict:
         return data
 
 
+# --- Поворот страницы ---
+
+# Альбомные таблицы в книжном скане (Приказы Минприроды №227, №228: 17 страниц из 179 в спайке
+# npa-vlm-ocr) лежат на боку — ни Tesseract, ни модели таблиц их так не читают. Угол даёт
+# Tesseract OSD («Rotate: 90»); ниже этой уверенности (мало текста на странице) страница считается
+# ровной. На 179 страницах спайка с этим порогом ни одна ровная страница не повёрнута.
+OSD_MIN_CONFIDENCE = 2.0
+
+
+def parse_osd_rotation(osd: str) -> int:
+    """Угол по часовой стрелке, на который надо повернуть страницу (0/90/180/270), из вывода OSD."""
+    rot = re.search(r"Rotate: (\d+)", osd)
+    conf = re.search(r"Orientation confidence: ([\d.]+)", osd)
+    if not rot or not conf or float(conf.group(1)) < OSD_MIN_CONFIDENCE:
+        return 0
+    return int(rot.group(1)) % 360
+
+
+def _default_orientation_fn(image_path: Path) -> int:
+    """Tesseract OSD. Пустая страница или страница почти без текста — OSD падает: считаем ровной."""
+    import pytesseract
+
+    tesseract_cmd = _resolve_tesseract_cmd()
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    try:
+        with Image.open(image_path) as img:
+            img.load()
+            return parse_osd_rotation(pytesseract.image_to_osd(img))
+    except (pytesseract.TesseractError, pytesseract.TesseractNotFoundError):
+        return 0
+
+
+def rotate_page_image(image_path: Path, rotation: int) -> tuple[int, int]:
+    """Поворачивает PNG страницы на rotation градусов по часовой (на месте); возвращает новый размер."""
+    with Image.open(image_path) as img:
+        rotated = img.rotate(-rotation, expand=True)
+    rotated.save(image_path)
+    return rotated.size
+
+
 def _default_detect_marks_fn(image_path: Path, low_word_boxes: list[Box]) -> list[mark_detection.Mark]:
     """Детектор по умолчанию: эвристика mark_detection.cluster_candidate_regions
     + классификация через настоящую Ollama (ai_escalation.classify_mark). См.
@@ -1761,6 +1802,8 @@ def ocr_document(
     resume: bool = True,
     progress_fn: Callable[[int, int, int, str], None] | None = None,
     use_ai_escalation: bool = False,
+    auto_rotate: bool = True,
+    orientation_fn: Callable[[Path], int] | None = None,
 ) -> OcrDocumentResult:
     """Точка входа этапа 3. Постранично: если у страницы уже есть текстовый слой
     (>= min_page_text_chars символов) — используется он как есть, OCR не
@@ -1773,6 +1816,10 @@ def ocr_document(
     штампами/печатями (VLM-инференс на CPU без GPU — десятки секунд на
     область). Включает поиск печатей/штампов/э-подписей и восстановление
     текста под ними, см. run_tesseract_text, docs/plan.md «ИИ-эскалация».
+
+    auto_rotate — страница-скан перед распознаванием поворачивается по Tesseract OSD
+    (orientation_fn, по умолчанию _default_orientation_fn): альбомные таблицы в книжном
+    скане. Повёрнутое изображение идёт и в таблицы, и в Tesseract.
 
     predict_tables_fn/image_data_fn — инъекция движков; по умолчанию настоящие
     тяжёлые модели (см. _default_predict_tables_fn/_default_image_data_fn), в
@@ -1810,8 +1857,11 @@ def ocr_document(
             "min_page_text_chars": min_page_text_chars,
             "authority_name": authority_name,
             "table_engine": table_engine,
+            "auto_rotate": auto_rotate,
             "pdf_size": pdf_path.stat().st_size,
         }
+        if orientation_fn is None:
+            orientation_fn = _default_orientation_fn
         reader = pypdf.PdfReader(str(pdf_path))
         fitz_doc = fitz.open(str(pdf_path))
         total = len(reader.pages)
@@ -1874,6 +1924,12 @@ def ocr_document(
             with timer.step(page_number, "рендер страницы"):
                 pix = fitz_page.get_pixmap(dpi=dpi)
                 pix.save(str(image_path))
+            page_height = float(pix.height)
+            if auto_rotate:
+                with timer.step(page_number, "поворот страницы (OSD)"):
+                    rotation = orientation_fn(image_path)
+                    if rotation:
+                        page_height = float(rotate_page_image(image_path, rotation)[1])
             timed_image_data = _timed_fn(timer, page_number, "текст: Tesseract", image_data_fn)
             if use_tatr:
 
@@ -1923,7 +1979,7 @@ def ocr_document(
                 page_number=page_number,
                 ocr_applied=True,
                 blocks=blocks,
-                page_height=float(pix.height),
+                page_height=page_height,
             )
             with timer.step(page_number, "сохранение страницы"):
                 _save_page(page_file, page, meta)
