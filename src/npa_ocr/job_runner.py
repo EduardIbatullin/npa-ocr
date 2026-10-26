@@ -119,6 +119,9 @@ def _default_command(pdf_path: Path, docx_path: Path, authority_name: str | None
     логируют ошибку и остаются без эскалации (mark_detection.detect_marks
     глушит исключения классификации), страница не падает."""
     cmd = ["npa-ocr", str(pdf_path), "--out", str(docx_path), "--ai-escalation"]
+    # Движок таблиц — настройка сервиса, не запроса: vlm требует vLLM (GPU) рядом с сервисом,
+    # см. docker-compose потребителя (NPA_OCR_TABLE_ENGINE=vlm, VLLM_URL)
+    cmd += ["--table-engine", os.environ.get("NPA_OCR_TABLE_ENGINE", "tatr")]
     if authority_name:
         cmd += ["--authority-name", authority_name]
     return cmd

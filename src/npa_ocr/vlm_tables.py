@@ -22,7 +22,9 @@ Tesseract или поставлен лишь по положению, помеч
 DOCX подсвечивает их жёлтым.
 
 Сетевой адрес vLLM — переменная окружения VLLM_URL (OpenAI-совместимый /v1), модель —
-VLLM_MODEL (served-model-name в vLLM).
+VLLM_MODEL (served-model-name в vLLM). В сервисе это адрес шлюза vlm_gate.py: он поднимает
+остановленный vLLM по первому запросу (холодный старт ~2–3 мин) и останавливает его после
+простоя — GPU на сервере общая. Отсюда большой VLLM_TIMEOUT.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import io
 import json
 import os
 import re
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -46,7 +49,8 @@ from npa_ocr.ocr_table import TableCell
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "deepseek-ocr")
-VLLM_TIMEOUT = 300.0
+# холодный старт vLLM через шлюз (до 10 мин ожидания) + сама страница (~7–60 с)
+VLLM_TIMEOUT = float(os.environ.get("VLLM_TIMEOUT", "900"))
 
 # Промпт режима «документ с координатами блоков» (рецепт DeepSeek-OCR)
 DEEPSEEK_PROMPT = "<|grounding|>Convert the document to markdown."
@@ -55,12 +59,15 @@ DEEPSEEK_PROMPT = "<|grounding|>Convert the document to markdown."
 MAX_TOKENS = 6144
 # Координаты блоков DeepSeek — в долях 0..999 от размера страницы
 _DS_SCALE = 999.0
-_CROP_PAD = 12  # px вокруг рамки DeepSeek при кропе таблицы (200 DPI)
 # Сетка годна, если в ней не нашли места не более этой доли ячеек DeepSeek
 _MAX_LOST_SHARE = 0.1
 
 
 # --- DeepSeek-OCR в vLLM ---
+
+
+class VlmUnavailable(RuntimeError):
+    """vLLM (или шлюз перед ним) не ответил: не поднят, не хватило памяти GPU, таймаут."""
 
 
 def deepseek_chat(image: Image.Image) -> str:
@@ -83,9 +90,12 @@ def deepseek_chat(image: Image.Image) -> str:
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=VLLM_TIMEOUT) as resp:
-        result = json.loads(resp.read())
-    return result["choices"][0]["message"].get("content") or ""
+    try:
+        with urllib.request.urlopen(req, timeout=VLLM_TIMEOUT) as resp:
+            result = json.loads(resp.read())
+        return result["choices"][0]["message"].get("content") or ""
+    except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError, KeyError, IndexError) as exc:
+        raise VlmUnavailable(f"vLLM ({VLLM_URL}) недоступен: {exc}") from exc
 
 
 # Ollama вырезает служебные токены, и метка приходит как «table[[x1, y1, x2, y2]]» — поддерживаем оба вида
@@ -756,7 +766,55 @@ def page_tables(page: Image.Image, tables: list[DsTable]) -> list[VlmTable]:
         else:
             cells, n_rows, n_cols = html_cells(html)
             out.append(VlmTable(box, cells, n_rows, n_cols, "deepseek", html, res.info))
+    # рамка таблицы по HTML DeepSeek — только разлинованная шапка, тело без линий ниже неё; по
+    # рамке из текста страницы вырезается область таблицы, иначе строки тела попадут в документ
+    # дважды — и в таблицу, и обычным текстом
+    out.sort(key=lambda t: t.bbox[1])
+    for i, t in enumerate(out):
+        if t.src == "deepseek":
+            limit = out[i + 1].bbox[1] if i + 1 < len(out) else page.height
+            t.bbox = extend_to_rows(page, t.bbox, t.cells, limit)
     return out
+
+
+def extend_to_rows(page: Image.Image, box: list[int], cells: list[TableCell], limit_y: int,
+                   pad: int = 12) -> list[int]:
+    """Продлевает рамку вниз по строкам текста страницы, которые есть в таблице: строка Tesseract
+    должна читаться (по порядку символов) в тексте строки таблицы — той же, что предыдущая, или
+    ниже (строки таблицы идут по порядку). Первая чужая строка — конец таблицы. Порядок важен:
+    1430 стр. 8 — подзаголовок «II. При сбросе … категории Б» вне этой таблицы почти дословно
+    совпадает с её строкой «I. При сбросе … категории А», но та уже пройдена."""
+    import pytesseract
+
+    from npa_ocr.ocr import _resolve_tesseract_cmd
+
+    x0, y0, x1, y1 = box
+    if limit_y - y1 < 20:
+        return box
+    cmd = _resolve_tesseract_cmd()
+    if cmd:
+        pytesseract.pytesseract.tesseract_cmd = cmd
+    d = pytesseract.image_to_data(page.crop((x0, y1, x1, limit_y)), lang="rus", config="--psm 6",
+                                  output_type=pytesseract.Output.DICT)
+    lines: dict[tuple[int, int, int], list[int]] = {}
+    for i, w in enumerate(d["text"]):
+        if w.strip() and float(d["conf"][i]) >= 0:
+            lines.setdefault((d["block_num"][i], d["par_num"][i], d["line_num"][i]), []).append(i)
+    rows: dict[int, list[TableCell]] = {}
+    for c in cells:
+        rows.setdefault(c.row, []).append(c)
+    row_texts = [" ".join(c.text for c in sorted(rows[r], key=lambda c: c.col)) for r in sorted(rows)]
+    bottom, current = y1, 0
+    for ids in sorted(lines.values(), key=lambda ids: min(d["top"][i] for i in ids)):
+        text = " ".join(d["text"][i] for i in sorted(ids, key=lambda i: d["left"][i]))
+        if len(norm(text)) < 2:
+            continue
+        found = next((k for k in range(current, len(row_texts)) if _contained(text, row_texts[k]) >= 0.8), None)
+        if found is None:
+            break
+        current = found
+        bottom = y1 + max(d["top"][i] + d["height"][i] for i in ids)
+    return [x0, y0, x1, min(page.height, bottom + pad) if bottom > y1 else y1]
 
 
 def run_vlm_tables(image_path: Path, *, chat_fn: Callable[[Image.Image], str] = deepseek_chat) -> list[VlmTable]:
