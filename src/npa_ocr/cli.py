@@ -70,6 +70,21 @@ def build_parser() -> argparse.ArgumentParser:
             "медленнее на страницах с печатями/штампами. По умолчанию выключено."
         ),
     )
+    parser.add_argument(
+        "--table-engine",
+        choices=["tatr", "vlm"],
+        default="tatr",
+        help=(
+            "Движок таблиц: tatr — TATR + PaddleOCR/RapidOCR на CPU (по умолчанию); "
+            "vlm — DeepSeek-OCR в vLLM на GPU (VLLM_URL, см. vlm_tables.py), "
+            "при недоступности vLLM — tatr"
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-rotate",
+        action="store_true",
+        help="Не поворачивать страницы-сканы по Tesseract OSD (альбомные таблицы на боку)",
+    )
     return parser
 
 
@@ -86,6 +101,8 @@ def cmd_ocr(args: argparse.Namespace) -> int:
             pages_dir=args.pages_dir,
             resume=not args.no_resume,
             use_ai_escalation=args.ai_escalation,
+            auto_rotate=not args.no_auto_rotate,
+            table_engine=args.table_engine,
         )
     except InsufficientMemoryError as exc:
         print(json.dumps({"status": "insufficient_memory", "message": str(exc)}, ensure_ascii=False, indent=2))

@@ -38,7 +38,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
@@ -46,7 +46,7 @@ from typing import Callable, Iterable, Iterator
 import pypdf
 from PIL import Image
 
-from npa_ocr import ai_escalation, mark_detection, table_structure
+from npa_ocr import ai_escalation, mark_detection, table_stitch, table_structure, vlm_reread, vlm_tables
 from npa_ocr.ocr_table import TableCell, normalize_header_text, reconstruct_table
 from npa_ocr.table_structure import TableStructure
 
@@ -99,6 +99,9 @@ class PageResult:
     blocks: list[PageBlock] = field(default_factory=list)
     plain_text: str | None = None  # для ocr_applied=False — текст из текстового слоя как есть
     page_height: float = 0.0  # пиксели; нужна для отбора колонтитулов (0 — не отбирать)
+    # первая таблица страницы дописана в таблицу предыдущей (stitch_tables) — в DOCX без разрыва
+    # страницы перед ней, иначе таблица на много страниц оставила бы за собой пустые страницы
+    continues_table: bool = False
 
 
 @dataclass
@@ -1136,6 +1139,72 @@ def run_tatr_tables(
     return blocks
 
 
+def _load_tatr_engines() -> tuple["_LazyEngine", "_LazyEngine"]:
+    """Движки пути table_engine="tatr": (регионы/текст кропов, текст ячеек).
+    TATR грузим ДО PaddleOCR: torch должен импортироваться раньше paddle на Windows.
+    PaddleOCR-движок (уточнение регионов таблиц) создаётся лениво (см. _LazyEngine).
+    На CPU без AVX2 Paddle падает с SIGILL — тогда регионы таблиц берёт Tesseract;
+    текст ячеек (RapidOCR/ONNX) от этого не зависит — работает в любом случае."""
+    table_structure.load_tatr()
+    cell_text_fn = _LazyEngine(_default_cell_text_fn)
+    if _paddle_runtime_usable():
+        return _LazyEngine(_default_predict_tables_fn), cell_text_fn
+    print("PaddleOCR недоступен на этом CPU (нет AVX2 / SIGILL) — регионы таблиц через Tesseract", file=sys.stderr)
+    return _LazyEngine(_tesseract_text_predict_fn), cell_text_fn
+
+
+def run_vlm_table_blocks(
+    image_path: Path,
+    chat_fn: Callable[[Image.Image], str],
+    *,
+    ask_fn: "vlm_reread.AskFn | None" = None,
+    timer: "StepTimer | None" = None,
+    page: int | None = None,
+) -> list[TableBlock]:
+    """Таблицы страницы через DeepSeek-OCR + сетку по линиям (vlm_tables.py) в виде TableBlock.
+    Сомнительные ячейки дочитываются по кропу (vlm_reread.py, ask_fn — инъекция модели; None —
+    без дочитки). Недочитанные ячейки «только Tesseract» и «по положению» помечены low_lines — в
+    DOCX жёлтые. vlm_tables.VlmUnavailable пробрасывается: запасной путь решает вызывающий."""
+    chat_seconds = [0.0]
+    reread_seconds = [0.0]
+
+    def timed_chat(img: Image.Image) -> str:
+        t0 = time.perf_counter()
+        try:
+            return chat_fn(img)
+        finally:
+            chat_seconds[0] = time.perf_counter() - t0
+
+    def timed_reread(crop: Image.Image, doubt: list[dict]) -> dict[tuple[int, int], str]:
+        t0 = time.perf_counter()
+        try:
+            return vlm_reread.reread_cells(crop, doubt, ask_fn)
+        finally:
+            reread_seconds[0] += time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    tables = vlm_tables.run_vlm_tables(
+        image_path, chat_fn=timed_chat, reread_fn=timed_reread if ask_fn is not None else None
+    )
+    elapsed = time.perf_counter() - t0
+    if timer is not None:
+        timer.add(page, "таблицы: DeepSeek-OCR (vLLM)", chat_seconds[0])
+        timer.add(page, "таблицы: сетка по линиям", elapsed - chat_seconds[0] - reread_seconds[0])
+        if reread_seconds[0]:
+            timer.add(page, "таблицы: дочитка ячеек (vLLM)", reread_seconds[0])
+    return [
+        TableBlock(
+            y=float(t.bbox[1]),
+            bbox=(float(t.bbox[0]), float(t.bbox[1]), float(t.bbox[2]), float(t.bbox[3])),
+            cells=t.cells,
+            n_rows=t.n_rows,
+            n_cols=t.n_cols,
+        )
+        for t in tables
+        if t.cells
+    ]
+
+
 def ocr_page(
     image_path: Path,
     *,
@@ -1362,6 +1431,65 @@ def remove_running_headers_and_footers(pages: list[PageResult]) -> list[PageResu
     return result
 
 
+# Продолжение таблицы: верхняя часть доходит ниже этой доли высоты страницы, продолжение
+# начинается выше этой (над ним — только колонтитул). Пороги спайка npa-vlm-ocr.
+_STITCH_BOTTOM_RATIO = 0.80
+_STITCH_TOP_RATIO = 0.15
+
+
+def stitch_tables(pages: list[PageResult]) -> tuple[list[PageResult], list[str]]:
+    """Сшивает таблицы, продолжающиеся на следующей странице (table_stitch.py): последняя
+    таблица страницы доходит до её низа, первая таблица следующей OCR-страницы начинается
+    сверху, число столбцов одно. Продолжение дописывается в таблицу верхней страницы и
+    убирается со своей; цепочка может идти через много страниц. Возвращает новые страницы
+    (входные не меняются) и журнал склеек."""
+    result: list[PageResult] = []
+    log: list[str] = []
+    # последняя таблица: (страница в result, индекс блока, номер страницы последней части, низ части)
+    last: tuple[PageResult, int, int, float] | None = None
+    for page in pages:
+        if not page.ocr_applied or page.page_height <= 0:
+            result.append(page)
+            last = None
+            continue
+        page = replace(page, blocks=list(page.blocks))
+        result.append(page)
+        kept: list[PageBlock] = []
+        first_table = True
+        for block in page.blocks:
+            if not isinstance(block, TableBlock):
+                kept.append(block)
+                continue
+            top_ratio = block.bbox[1] / page.page_height
+            bottom_ratio = block.bbox[3] / page.page_height
+            if (
+                first_table
+                and last is not None
+                and last[2] == page.page_number - 1
+                and last[3] >= _STITCH_BOTTOM_RATIO
+                and top_ratio <= _STITCH_TOP_RATIO
+                and last[0].blocks[last[1]].n_cols == block.n_cols
+            ):
+                host_page, index, _, _ = last
+                host = host_page.blocks[index]
+                cells, n_rows, done = table_stitch.merge_continuation(
+                    host.cells, host.n_rows, block.cells, block.n_rows
+                )
+                host_page.blocks[index] = replace(host, cells=cells, n_rows=n_rows)
+                page.continues_table = True
+                log.append(
+                    f"стр. {page.page_number}: продолжение таблицы со стр. {host_page.page_number} — "
+                    + ("; ".join(done) or "склеено без правок")
+                )
+                last = (host_page, index, page.page_number, bottom_ratio)
+            else:
+                kept.append(block)
+                last = (page, len(kept) - 1, page.page_number, bottom_ratio)
+            first_table = False
+        page.blocks[:] = kept
+    return result, log
+
+
 def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DPI) -> None:
     """Страницы с готовым текстовым слоем (ocr_applied=False) — текст как есть, без
     изменений. OCR-страницы — блоки по порядку чтения: текстовые строки склеиваются
@@ -1385,7 +1513,7 @@ def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DP
             "Жёлтым выделено текст, распознанный с низкой уверенностью: проверьте его по скану."
         )
     for i, page in enumerate(pages):
-        if i > 0:
+        if i > 0 and not page.continues_table:
             doc.add_page_break()
         if not page.ocr_applied:
             doc.add_paragraph(page.plain_text or "")
@@ -1579,6 +1707,47 @@ def _default_image_data_fn(image_path: Path) -> dict:
         return data
 
 
+# --- Поворот страницы ---
+
+# Альбомные таблицы в книжном скане (Приказы Минприроды №227, №228: 17 страниц из 179 в спайке
+# npa-vlm-ocr) лежат на боку — ни Tesseract, ни модели таблиц их так не читают. Угол даёт
+# Tesseract OSD («Rotate: 90»); ниже этой уверенности (мало текста на странице) страница считается
+# ровной. На 179 страницах спайка с этим порогом ни одна ровная страница не повёрнута.
+OSD_MIN_CONFIDENCE = 2.0
+
+
+def parse_osd_rotation(osd: str) -> int:
+    """Угол по часовой стрелке, на который надо повернуть страницу (0/90/180/270), из вывода OSD."""
+    rot = re.search(r"Rotate: (\d+)", osd)
+    conf = re.search(r"Orientation confidence: ([\d.]+)", osd)
+    if not rot or not conf or float(conf.group(1)) < OSD_MIN_CONFIDENCE:
+        return 0
+    return int(rot.group(1)) % 360
+
+
+def _default_orientation_fn(image_path: Path) -> int:
+    """Tesseract OSD. Пустая страница или страница почти без текста — OSD падает: считаем ровной."""
+    import pytesseract
+
+    tesseract_cmd = _resolve_tesseract_cmd()
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    try:
+        with Image.open(image_path) as img:
+            img.load()
+            return parse_osd_rotation(pytesseract.image_to_osd(img))
+    except (pytesseract.TesseractError, pytesseract.TesseractNotFoundError):
+        return 0
+
+
+def rotate_page_image(image_path: Path, rotation: int) -> tuple[int, int]:
+    """Поворачивает PNG страницы на rotation градусов по часовой (на месте); возвращает новый размер."""
+    with Image.open(image_path) as img:
+        rotated = img.rotate(-rotation, expand=True)
+    rotated.save(image_path)
+    return rotated.size
+
+
 def _default_detect_marks_fn(image_path: Path, low_word_boxes: list[Box]) -> list[mark_detection.Mark]:
     """Детектор по умолчанию: эвристика mark_detection.cluster_candidate_regions
     + классификация через настоящую Ollama (ai_escalation.classify_mark). См.
@@ -1761,6 +1930,10 @@ def ocr_document(
     resume: bool = True,
     progress_fn: Callable[[int, int, int, str], None] | None = None,
     use_ai_escalation: bool = False,
+    auto_rotate: bool = True,
+    orientation_fn: Callable[[Path], int] | None = None,
+    vlm_chat_fn: Callable[[Image.Image], str] | None = None,
+    vlm_ask_fn: "vlm_reread.AskFn | None" = None,
 ) -> OcrDocumentResult:
     """Точка входа этапа 3. Постранично: если у страницы уже есть текстовый слой
     (>= min_page_text_chars символов) — используется он как есть, OCR не
@@ -1773,6 +1946,15 @@ def ocr_document(
     штампами/печатями (VLM-инференс на CPU без GPU — десятки секунд на
     область). Включает поиск печатей/штампов/э-подписей и восстановление
     текста под ними, см. run_tesseract_text, docs/plan.md «ИИ-эскалация».
+
+    auto_rotate — страница-скан перед распознаванием поворачивается по Tesseract OSD
+    (orientation_fn, по умолчанию _default_orientation_fn): альбомные таблицы в книжном
+    скане. Повёрнутое изображение идёт и в таблицы, и в Tesseract.
+
+    table_engine="vlm" — таблицы через DeepSeek-OCR в vLLM на GPU (vlm_tables.py,
+    vlm_chat_fn — инъекция модели); сомнительные ячейки дочитываются по кропу (vlm_reread.py,
+    vlm_ask_fn — инъекция модели). Если vLLM не ответил — до конца документа TATR. Таблицы,
+    продолжающиеся на следующей странице, при этом сшиваются в одну (stitch_tables).
 
     predict_tables_fn/image_data_fn — инъекция движков; по умолчанию настоящие
     тяжёлые модели (см. _default_predict_tables_fn/_default_image_data_fn), в
@@ -1810,8 +1992,14 @@ def ocr_document(
             "min_page_text_chars": min_page_text_chars,
             "authority_name": authority_name,
             "table_engine": table_engine,
+            "auto_rotate": auto_rotate,
             "pdf_size": pdf_path.stat().st_size,
         }
+        if table_engine == "vlm":
+            # версия пути vlm: 2 — с дочиткой ячеек; страницы прежних прогонов пересчитываются
+            meta["vlm_version"] = 2
+        if orientation_fn is None:
+            orientation_fn = _default_orientation_fn
         reader = pypdf.PdfReader(str(pdf_path))
         fitz_doc = fitz.open(str(pdf_path))
         total = len(reader.pages)
@@ -1820,6 +2008,10 @@ def ocr_document(
 
     text_predict_fn: Callable | None = None
     cell_text_fn: Callable | None = None
+    vlm_down: str | None = None  # table_engine="vlm": причина, по которой vLLM недоступен
+    tatr_fallback_pages: set[int] = set()  # table_engine="vlm": таблицы страницы ушли в TATR
+    vlm_chat_fn = vlm_chat_fn or vlm_tables.deepseek_chat
+    vlm_ask_fn = vlm_ask_fn or vlm_reread.deepseek_ask
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i, (pdf_page, fitz_page) in enumerate(zip(reader.pages, fitz_doc)):
             page_number = i + 1
@@ -1844,24 +2036,11 @@ def ocr_document(
             with timer.step(page_number, "проверка свободной памяти"):
                 ensure_free_memory(min_free_memory_mb, f"перед страницей {page_number}")
             use_tatr = table_engine == "tatr" and predict_tables_fn is None
+            use_vlm = table_engine == "vlm" and predict_tables_fn is None
             with timer.step(page_number, "загрузка моделей"):
                 if use_tatr and text_predict_fn is None:
-                    # TATR грузим ДО PaddleOCR: torch должен импортироваться раньше paddle на Windows.
-                    # PaddleOCR-движок (уточнение регионов таблиц) создаётся лениво (см. _LazyEngine).
-                    # На CPU без AVX2 Paddle падает с SIGILL — тогда регионы таблиц берёт Tesseract;
-                    # текст ячеек (RapidOCR/ONNX) от этого не зависит — работает в любом случае.
-                    table_structure.load_tatr()
-                    cell_text_fn = _LazyEngine(_default_cell_text_fn)
-                    if _paddle_runtime_usable():
-                        text_predict_fn = _LazyEngine(_default_predict_tables_fn)
-                    else:
-                        print(
-                            "PaddleOCR недоступен на этом CPU (нет AVX2 / SIGILL) — "
-                            "регионы таблиц через Tesseract",
-                            file=sys.stderr,
-                        )
-                        text_predict_fn = _LazyEngine(_tesseract_text_predict_fn)
-                if predict_tables_fn is None and not use_tatr:
+                    text_predict_fn, cell_text_fn = _load_tatr_engines()
+                if predict_tables_fn is None and not use_tatr and not use_vlm:
                     if not _paddle_runtime_usable():
                         raise RuntimeError(
                             "PaddleOCR недоступен на этом CPU (нет AVX2 / SIGILL). "
@@ -1874,35 +2053,59 @@ def ocr_document(
             with timer.step(page_number, "рендер страницы"):
                 pix = fitz_page.get_pixmap(dpi=dpi)
                 pix.save(str(image_path))
+            page_height = float(pix.height)
+            if auto_rotate:
+                with timer.step(page_number, "поворот страницы (OSD)"):
+                    rotation = orientation_fn(image_path)
+                    if rotation:
+                        page_height = float(rotate_page_image(image_path, rotation)[1])
             timed_image_data = _timed_fn(timer, page_number, "текст: Tesseract", image_data_fn)
-            if use_tatr:
 
-                def tables_fn(path: Path, _page: int = page_number) -> list[TableBlock]:
-                    regions_seconds = [0.0]
+            def tatr_tables_fn(path: Path, _page: int = page_number) -> list[TableBlock]:
+                nonlocal text_predict_fn, cell_text_fn
+                if text_predict_fn is None:  # запасной путь table_engine="vlm" — модели TATR по требованию
+                    with timer.step(_page, "загрузка моделей"):
+                        text_predict_fn, cell_text_fn = _load_tatr_engines()
+                regions_seconds = [0.0]
 
-                    def timed_regions(img: Image.Image) -> list[Box]:
-                        t0 = time.perf_counter()
-                        found = table_regions_for_page(img, text_predict_fn)
-                        regions_seconds[0] = time.perf_counter() - t0
-                        return found
-
+                def timed_regions(img: Image.Image) -> list[Box]:
                     t0 = time.perf_counter()
-                    result = run_tatr_tables(
-                        path,
-                        text_predict_fn,
-                        cell_text_fn=cell_text_fn,
-                        region_fn=timed_regions,
-                        release_structure=text_predict_fn.release,
-                        release_cells=cell_text_fn.release,
-                    )
-                    elapsed = time.perf_counter() - t0
-                    timer.add(_page, "таблицы: поиск областей", regions_seconds[0])
-                    timer.add(_page, "таблицы: структура и текст ячеек", elapsed - regions_seconds[0])
-                    return result
+                    found = table_regions_for_page(img, text_predict_fn)
+                    regions_seconds[0] = time.perf_counter() - t0
+                    return found
 
+                t0 = time.perf_counter()
+                result = run_tatr_tables(
+                    path,
+                    text_predict_fn,
+                    cell_text_fn=cell_text_fn,
+                    region_fn=timed_regions,
+                    release_structure=text_predict_fn.release,
+                    release_cells=cell_text_fn.release,
+                )
+                elapsed = time.perf_counter() - t0
+                timer.add(_page, "таблицы: поиск областей", regions_seconds[0])
+                timer.add(_page, "таблицы: структура и текст ячеек", elapsed - regions_seconds[0])
+                return result
+
+            def vlm_tables_fn(path: Path, _page: int = page_number) -> list[TableBlock]:
+                # vLLM не ответил — до конца документа таблицы через TATR: документ не падает и не
+                # ждёт таймаут на каждой странице; причина — в шагах timings
+                nonlocal vlm_down
+                if vlm_down is None:
+                    try:
+                        return run_vlm_table_blocks(path, vlm_chat_fn, ask_fn=vlm_ask_fn, timer=timer, page=_page)
+                    except vlm_tables.VlmUnavailable as exc:
+                        vlm_down = str(exc)
+                        print(f"{exc} — таблицы через TATR до конца документа", file=sys.stderr, flush=True)
+                        timer.add(_page, f"таблицы: vLLM недоступен, запасной путь TATR ({exc})", 0.0)
+                tatr_fallback_pages.add(_page)
+                return tatr_tables_fn(path)
+
+            if use_tatr or use_vlm:
                 blocks = ocr_page(
                     image_path,
-                    table_blocks_fn=tables_fn,
+                    table_blocks_fn=vlm_tables_fn if use_vlm else tatr_tables_fn,
                     image_data_fn=timed_image_data,
                     confidence_threshold=confidence_threshold,
                     authority_name=authority_name,
@@ -1923,10 +2126,13 @@ def ocr_document(
                 page_number=page_number,
                 ocr_applied=True,
                 blocks=blocks,
-                page_height=float(pix.height),
+                page_height=page_height,
             )
+            # страница с таблицами из запасного TATR — с другой meta: следующий прогон того же PDF
+            # (сервис кладёт страницы по имени файла) не возьмёт её, а распознает через vLLM заново
+            page_meta = {**meta, "tables": "tatr"} if page_number in tatr_fallback_pages else meta
             with timer.step(page_number, "сохранение страницы"):
-                _save_page(page_file, page, meta)
+                _save_page(page_file, page, page_meta)
             pages.append(page)
             report(page_number, total, page_number, "готово")
 
@@ -1934,6 +2140,12 @@ def ocr_document(
         fitz_doc.close()
     with timer.step(None, "Колонтитулы"):
         pages = remove_running_headers_and_footers(pages)
+    if table_engine == "vlm":
+        # пороги сшивки проверены на рамках таблиц vlm_tables; у TATR рамки другие
+        with timer.step(None, "Сшивка таблиц между страницами"):
+            pages, stitch_log = stitch_tables(pages)
+        for line in stitch_log:
+            print(f"  [сшивка] {line}", file=sys.stderr, flush=True)
     with timer.step(None, "Сборка DOCX"):
         build_docx(pages, out_docx_path, dpi=dpi)
 

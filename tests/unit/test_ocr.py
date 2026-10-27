@@ -1678,3 +1678,250 @@ def test_run_tatr_tables_does_not_call_img2table_fallback_when_region_is_not_cli
     )
     assert len(blocks) == 1  # таблица принята и без fallback — регион не узкий
     assert calls == []  # fallback не вызван — регион не выглядит обрезанным
+
+
+# --- Поворот страницы по Tesseract OSD ---
+
+ROTATION_PAGES = Path(__file__).parent / "fixtures" / "vlm_tables"
+
+
+def test_parse_osd_rotation_needs_confidence():
+    from npa_ocr.ocr import parse_osd_rotation
+
+    osd = "Page number: 0\nOrientation in degrees: 270\nRotate: 90\nOrientation confidence: 7.41\n"
+    assert parse_osd_rotation(osd) == 90
+    assert parse_osd_rotation(osd.replace("7.41", "1.20")) == 0  # мало текста — не доверяем
+    assert parse_osd_rotation("") == 0
+
+
+def _blank_scan_pdf(path: Path) -> Path:
+    import fitz
+
+    doc = fitz.open()
+    doc.new_page()  # пустая страница — имитация скана без текстового слоя (595×842 pt, книжная)
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+def test_ocr_document_rotates_scan_before_tables_and_text(tmp_path: Path):
+    """Альбомная таблица в книжном скане: страница поворачивается до распознавания, и таблицы,
+    и Tesseract получают уже повёрнутое (альбомное) изображение."""
+    pdf_path = _blank_scan_pdf(tmp_path / "scan.pdf")
+    sizes = {}
+
+    def fake_predict(path):
+        with Image.open(path) as img:
+            sizes["tables"] = img.size
+        return _load_simple_table_json()
+
+    def fake_image_data(path):
+        with Image.open(path) as img:
+            sizes["text"] = img.size
+        return _tesseract_data([("Распознано", 90, 10, 5, 100, 20)])
+
+    result = ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        predict_tables_fn=fake_predict,
+        image_data_fn=fake_image_data,
+        orientation_fn=lambda _path: 90,
+        progress_fn=lambda *a: None,
+    )
+    w, h = sizes["text"]
+    assert w > h  # книжная страница стала альбомной
+    assert sizes["tables"] == sizes["text"]
+    assert result.pages[0].page_height == h
+    steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
+    assert "поворот страницы (OSD)" in steps
+
+
+def test_ocr_document_without_auto_rotate_does_not_ask_orientation(tmp_path: Path):
+    pdf_path = _blank_scan_pdf(tmp_path / "scan.pdf")
+
+    def _should_not_be_called(_path):
+        raise AssertionError("auto_rotate=False — OSD не вызывается")
+
+    result = ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        predict_tables_fn=lambda _p: _load_simple_table_json(),
+        image_data_fn=lambda _p: _tesseract_data([("Распознано", 90, 10, 5, 100, 20)]),
+        auto_rotate=False,
+        orientation_fn=_should_not_be_called,
+        progress_fn=lambda *a: None,
+    )
+    assert result.pages[0].ocr_applied is True
+
+
+def _has_tesseract() -> bool:
+    import shutil
+
+    from npa_ocr.ocr import _resolve_tesseract_cmd
+
+    return bool(_resolve_tesseract_cmd() or shutil.which("tesseract"))
+
+
+@pytest.mark.skipif(not _has_tesseract(), reason="нет Tesseract")
+@pytest.mark.parametrize(
+    "key, turned, expected",
+    [
+        ("228_p025", 90, 90),  # альбомная таблица на боку (Приказ №228)
+        ("227_p009", 180, 180),  # перевёрнутая страница (Приказ №227)
+        ("191_p015", 0, 0),  # обычная книжная страница с таблицей
+    ],
+)
+def test_default_orientation_fn_on_real_pages(tmp_path: Path, key: str, turned: int, expected: int):
+    """Страницы спайка npa-vlm-ocr хранятся уже выровненными — возвращаем им исходный поворот
+    скана и проверяем, что OSD находит угол, который его исправляет."""
+    from npa_ocr.ocr import _default_orientation_fn, rotate_page_image
+
+    path = tmp_path / f"{key}.png"
+    with Image.open(ROTATION_PAGES / f"{key}.png") as img:
+        img.rotate(turned, expand=True).save(path)
+    rotation = _default_orientation_fn(path)
+    assert rotation == expected
+    if rotation:
+        rotate_page_image(path, rotation)
+        with Image.open(path) as fixed, Image.open(ROTATION_PAGES / f"{key}.png") as orig:
+            assert fixed.size == orig.size
+
+
+# --- table_engine="vlm": таблицы через DeepSeek-OCR (vLLM) ---
+
+
+def _pdf_from_page_image(path: Path, image: Path, dpi: int = 200) -> Path:
+    """Скан без текстового слоя из PNG страницы спайка: при рендере в том же DPI — те же пиксели."""
+    import fitz
+
+    with Image.open(image) as img:
+        w, h = img.size
+    doc = fitz.open()
+    page = doc.new_page(width=w * 72 / dpi, height=h * 72 / dpi)
+    page.insert_image(page.rect, filename=str(image))
+    doc.save(str(path))
+    doc.close()
+    return path
+
+
+@pytest.mark.skipif(not _has_tesseract(), reason="нет Tesseract")
+def test_ocr_document_vlm_engine_tables_and_text_without_duplicates(tmp_path: Path):
+    """1430 стр. 8: таблицы — по ответу DeepSeek (тело без линий — её HTML как есть); строки тела
+    ниже разлинованной шапки входят в рамку таблицы и не дублируются обычным текстом, а
+    подзаголовок «II. При сбросе…» между таблицами остаётся текстом."""
+    page_png = ROTATION_PAGES / "1430_p008.png"
+    raw = (ROTATION_PAGES / "1430_p008.txt").read_text(encoding="utf-8")
+    pdf_path = _pdf_from_page_image(tmp_path / "scan.pdf", page_png)
+    words = _tesseract_data_multiline([
+        ("Сверхмалые", 95, 190, 1700, 200, 30, 1),  # строка тела первой таблицы
+        ("II.", 95, 400, 1840, 40, 30, 2),  # подзаголовок между таблицами
+        ("При", 95, 450, 1840, 60, 30, 2),
+    ])
+
+    result = ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        table_engine="vlm",
+        vlm_chat_fn=lambda _img: raw,
+        image_data_fn=lambda _p: words,
+        auto_rotate=False,
+        progress_fn=lambda *a: None,
+    )
+    blocks = result.pages[0].blocks
+    tables = [b for b in blocks if isinstance(b, TableBlock)]
+    texts = [b.text for b in blocks if isinstance(b, TextBlock)]
+    assert len(tables) == 2
+    assert any(c.text == "Сверхмалые - средние очистные сооружения" for c in tables[0].cells)
+    assert not any("Сверхмалые" in t for t in texts)
+    assert any(t.startswith("II.") for t in texts)
+    steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
+    assert "таблицы: DeepSeek-OCR (vLLM)" in steps and "таблицы: сетка по линиям" in steps
+
+
+@pytest.mark.skipif(not _has_tesseract(), reason="нет Tesseract")
+def test_ocr_document_vlm_engine_rereads_doubtful_cells(tmp_path: Path):
+    """565 стр. 7: сомнительные ячейки сетки дочитываются по кропу (vlm_ask_fn); принятый текст —
+    в ячейке без жёлтой пометки, время — отдельным шагом timings."""
+    page_png = ROTATION_PAGES / "565_p007.png"
+    raw = (ROTATION_PAGES / "565_p007.txt").read_text(encoding="utf-8")
+    pdf_path = _pdf_from_page_image(tmp_path / "scan.pdf", page_png)
+    asked = []
+
+    def ask(img, prompt):
+        asked.append(prompt)
+        return "мг/нм³", "stop", -0.05
+
+    result = ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        table_engine="vlm",
+        vlm_chat_fn=lambda _img: raw,
+        vlm_ask_fn=ask,
+        image_data_fn=lambda _p: _tesseract_data([("Текст", 95, 10, 10, 100, 20)]),
+        auto_rotate=False,
+        progress_fn=lambda *a: None,
+    )
+    assert asked
+    (table,) = [b for b in result.pages[0].blocks if isinstance(b, TableBlock)]
+    reread = [c for c in table.cells if c.text == "мг/нм³"]
+    assert reread and not any(any(c.low_lines) for c in reread)
+    steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
+    assert "таблицы: дочитка ячеек (vLLM)" in steps
+
+
+def test_ocr_document_vlm_unavailable_falls_back_to_tatr_for_rest_of_document(tmp_path: Path, monkeypatch):
+    """vLLM не ответил — документ не падает: таблицы через TATR, vLLM больше не спрашиваем
+    (не ждём таймаут на каждой странице), причина — в шагах timings."""
+    import fitz
+
+    from npa_ocr import ocr as ocr_module
+    from npa_ocr.vlm_tables import VlmUnavailable
+
+    pdf_path = tmp_path / "scan.pdf"
+    doc = fitz.open()
+    doc.new_page()
+    doc.new_page()
+    doc.save(str(pdf_path))
+    doc.close()
+
+    class _Engine:
+        def release(self):
+            pass
+
+    tatr_pages = []
+    monkeypatch.setattr(ocr_module, "_load_tatr_engines", lambda: (_Engine(), _Engine()))
+    monkeypatch.setattr(ocr_module, "run_tatr_tables", lambda path, *a, **kw: tatr_pages.append(path) or [])
+    chat_calls = []
+
+    def down(_img):
+        chat_calls.append(1)
+        raise VlmUnavailable("vLLM (http://vlm-gate:8000/v1) недоступен: 503")
+
+    result = ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        table_engine="vlm",
+        vlm_chat_fn=down,
+        image_data_fn=lambda _p: _tesseract_data([("Текст", 95, 10, 10, 100, 20)]),
+        auto_rotate=False,
+        progress_fn=lambda *a: None,
+    )
+    assert len(chat_calls) == 1
+    assert len(tatr_pages) == 2
+    assert all(p.ocr_applied for p in result.pages)
+    steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
+    assert any(s.startswith("таблицы: vLLM недоступен, запасной путь TATR") for s in steps)
+
+    # следующий прогон того же PDF (vLLM уже поднялся) не берёт страницы запасного пути из
+    # сохранённых, а распознаёт их через vLLM
+    chat_ok = []
+    ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        table_engine="vlm",
+        vlm_chat_fn=lambda _img: chat_ok.append(1) or "",
+        image_data_fn=lambda _p: _tesseract_data([("Текст", 95, 10, 10, 100, 20)]),
+        auto_rotate=False,
+        progress_fn=lambda *a: None,
+    )
+    assert len(chat_ok) == 2

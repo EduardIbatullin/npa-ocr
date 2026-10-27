@@ -36,12 +36,18 @@ RUN pip install --no-cache-dir torch torchvision --index-url https://download.py
 
 # Зависимости отдельно — слой кэшируется при неизменном pyproject.toml.
 # server — HTTP API (npa_ocr.server), см. README, «HTTP API».
-COPY pyproject.toml README.md ./
+# Ставятся до копирования кода, по заглушкам пакета и README: иначе любая правка src или
+# README заново качала бы все зависимости (на nv-02 — 100 мин, 2026-10-27). Установка
+# editable — пакет читается из /app/src, настоящий код ложится туда ниже.
+COPY pyproject.toml ./
+RUN mkdir -p src/npa_ocr && touch src/npa_ocr/__init__.py README.md \
+    && pip install --no-cache-dir -e ".[models,server]"
+COPY README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir -e ".[models,server]"
 
 # Модели качаются и кэшируются здесь, на этапе сборки, а не при первом реальном
-# запросе — см. docstring scripts/preload_models.py.
+# запросе — см. docstring scripts/preload_models.py. После правки кода повторяется
+# (~2 мин): скрипт берёт движки из npa_ocr.
 COPY scripts ./scripts
 RUN python scripts/preload_models.py
 

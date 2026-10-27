@@ -48,7 +48,24 @@ npa-ocr scan.pdf --out result.docx --pages-dir run/pages      # папка по�
 npa-ocr scan.pdf --out result.docx --no-resume                # пересчитать все страницы
 npa-ocr scan.pdf --out result.docx --min-free-mb 0             # отключить защиту памяти
 npa-ocr scan.pdf --out result.docx --ai-escalation              # восстановить текст под печатью/штампом через VLM
+npa-ocr scan.pdf --out result.docx --table-engine vlm           # таблицы через DeepSeek-OCR в vLLM (GPU)
+npa-ocr scan.pdf --out result.docx --no-auto-rotate              # не поворачивать страницы по OSD
 ```
+
+`--table-engine vlm` — таблицы через DeepSeek-OCR в vLLM на GPU (~7 с на страницу
+вместо минут у TATR на CPU) со структурой по линиям скана, см. `src/npa_ocr/vlm_tables.py`.
+Адрес — `VLLM_URL` (OpenAI-совместимый `/v1`). Если vLLM не ответил, таблицы до конца
+документа идут прежним путём (`tatr`), причина — в таймингах. Таблица, продолжающаяся на
+следующей странице, сшивается в одну (`src/npa_ocr/table_stitch.py`). Сомнительные ячейки
+(текст только от Tesseract и т. п.) дочитываются DeepSeek-OCR по кропу ячейки
+(`src/npa_ocr/vlm_reread.py`); недочитанные остаются жёлтыми. В сервисе vLLM стоит за
+шлюзом `python -m npa_ocr.vlm_gate`: он запускает контейнер vLLM по первому запросу и
+останавливает после `VLM_IDLE_MIN` минут простоя (GPU общая). Пример — сервисы `vlm` и
+`vlm-gate` в docker-compose npa-downloader. Для HTTP API движок задаёт переменная
+`NPA_OCR_TABLE_ENGINE` сервиса (по умолчанию `tatr`).
+
+Страницы-сканы перед распознаванием поворачиваются по Tesseract OSD (альбомные
+таблицы, лежащие на боку); `--no-auto-rotate` отключает поворот.
 
 Распознаются только страницы без текстового слоя — страницы с текстом берутся как
 есть. `--authority-name` включает восстановление формулы должности подписанта,
