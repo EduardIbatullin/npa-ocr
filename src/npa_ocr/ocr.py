@@ -38,7 +38,7 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
@@ -46,7 +46,7 @@ from typing import Callable, Iterable, Iterator
 import pypdf
 from PIL import Image
 
-from npa_ocr import ai_escalation, mark_detection, table_structure, vlm_tables
+from npa_ocr import ai_escalation, mark_detection, table_stitch, table_structure, vlm_tables
 from npa_ocr.ocr_table import TableCell, normalize_header_text, reconstruct_table
 from npa_ocr.table_structure import TableStructure
 
@@ -99,6 +99,9 @@ class PageResult:
     blocks: list[PageBlock] = field(default_factory=list)
     plain_text: str | None = None  # для ocr_applied=False — текст из текстового слоя как есть
     page_height: float = 0.0  # пиксели; нужна для отбора колонтитулов (0 — не отбирать)
+    # первая таблица страницы дописана в таблицу предыдущей (stitch_tables) — в DOCX без разрыва
+    # страницы перед ней, иначе таблица на много страниц оставила бы за собой пустые страницы
+    continues_table: bool = False
 
 
 @dataclass
@@ -1414,6 +1417,65 @@ def remove_running_headers_and_footers(pages: list[PageResult]) -> list[PageResu
     return result
 
 
+# Продолжение таблицы: верхняя часть доходит ниже этой доли высоты страницы, продолжение
+# начинается выше этой (над ним — только колонтитул). Пороги спайка npa-vlm-ocr.
+_STITCH_BOTTOM_RATIO = 0.80
+_STITCH_TOP_RATIO = 0.15
+
+
+def stitch_tables(pages: list[PageResult]) -> tuple[list[PageResult], list[str]]:
+    """Сшивает таблицы, продолжающиеся на следующей странице (table_stitch.py): последняя
+    таблица страницы доходит до её низа, первая таблица следующей OCR-страницы начинается
+    сверху, число столбцов одно. Продолжение дописывается в таблицу верхней страницы и
+    убирается со своей; цепочка может идти через много страниц. Возвращает новые страницы
+    (входные не меняются) и журнал склеек."""
+    result: list[PageResult] = []
+    log: list[str] = []
+    # последняя таблица: (страница в result, индекс блока, номер страницы последней части, низ части)
+    last: tuple[PageResult, int, int, float] | None = None
+    for page in pages:
+        if not page.ocr_applied or page.page_height <= 0:
+            result.append(page)
+            last = None
+            continue
+        page = replace(page, blocks=list(page.blocks))
+        result.append(page)
+        kept: list[PageBlock] = []
+        first_table = True
+        for block in page.blocks:
+            if not isinstance(block, TableBlock):
+                kept.append(block)
+                continue
+            top_ratio = block.bbox[1] / page.page_height
+            bottom_ratio = block.bbox[3] / page.page_height
+            if (
+                first_table
+                and last is not None
+                and last[2] == page.page_number - 1
+                and last[3] >= _STITCH_BOTTOM_RATIO
+                and top_ratio <= _STITCH_TOP_RATIO
+                and last[0].blocks[last[1]].n_cols == block.n_cols
+            ):
+                host_page, index, _, _ = last
+                host = host_page.blocks[index]
+                cells, n_rows, done = table_stitch.merge_continuation(
+                    host.cells, host.n_rows, block.cells, block.n_rows
+                )
+                host_page.blocks[index] = replace(host, cells=cells, n_rows=n_rows)
+                page.continues_table = True
+                log.append(
+                    f"стр. {page.page_number}: продолжение таблицы со стр. {host_page.page_number} — "
+                    + ("; ".join(done) or "склеено без правок")
+                )
+                last = (host_page, index, page.page_number, bottom_ratio)
+            else:
+                kept.append(block)
+                last = (page, len(kept) - 1, page.page_number, bottom_ratio)
+            first_table = False
+        page.blocks[:] = kept
+    return result, log
+
+
 def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DPI) -> None:
     """Страницы с готовым текстовым слоем (ocr_applied=False) — текст как есть, без
     изменений. OCR-страницы — блоки по порядку чтения: текстовые строки склеиваются
@@ -1437,7 +1499,7 @@ def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DP
             "Жёлтым выделено текст, распознанный с низкой уверенностью: проверьте его по скану."
         )
     for i, page in enumerate(pages):
-        if i > 0:
+        if i > 0 and not page.continues_table:
             doc.add_page_break()
         if not page.ocr_applied:
             doc.add_paragraph(page.plain_text or "")
@@ -1875,7 +1937,8 @@ def ocr_document(
     скане. Повёрнутое изображение идёт и в таблицы, и в Tesseract.
 
     table_engine="vlm" — таблицы через DeepSeek-OCR в vLLM на GPU (vlm_tables.py,
-    vlm_chat_fn — инъекция модели); если vLLM не ответил — до конца документа TATR.
+    vlm_chat_fn — инъекция модели); если vLLM не ответил — до конца документа TATR. Таблицы,
+    продолжающиеся на следующей странице, при этом сшиваются в одну (stitch_tables).
 
     predict_tables_fn/image_data_fn — инъекция движков; по умолчанию настоящие
     тяжёлые модели (см. _default_predict_tables_fn/_default_image_data_fn), в
@@ -2052,6 +2115,12 @@ def ocr_document(
         fitz_doc.close()
     with timer.step(None, "Колонтитулы"):
         pages = remove_running_headers_and_footers(pages)
+    if table_engine == "vlm":
+        # пороги сшивки проверены на рамках таблиц vlm_tables; у TATR рамки другие
+        with timer.step(None, "Сшивка таблиц между страницами"):
+            pages, stitch_log = stitch_tables(pages)
+        for line in stitch_log:
+            print(f"  [сшивка] {line}", file=sys.stderr, flush=True)
     with timer.step(None, "Сборка DOCX"):
         build_docx(pages, out_docx_path, dpi=dpi)
 
