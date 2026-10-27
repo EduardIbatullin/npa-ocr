@@ -2009,6 +2009,7 @@ def ocr_document(
     text_predict_fn: Callable | None = None
     cell_text_fn: Callable | None = None
     vlm_down: str | None = None  # table_engine="vlm": причина, по которой vLLM недоступен
+    tatr_fallback_pages: set[int] = set()  # table_engine="vlm": таблицы страницы ушли в TATR
     vlm_chat_fn = vlm_chat_fn or vlm_tables.deepseek_chat
     vlm_ask_fn = vlm_ask_fn or vlm_reread.deepseek_ask
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2098,6 +2099,7 @@ def ocr_document(
                         vlm_down = str(exc)
                         print(f"{exc} — таблицы через TATR до конца документа", file=sys.stderr, flush=True)
                         timer.add(_page, f"таблицы: vLLM недоступен, запасной путь TATR ({exc})", 0.0)
+                tatr_fallback_pages.add(_page)
                 return tatr_tables_fn(path)
 
             if use_tatr or use_vlm:
@@ -2126,8 +2128,11 @@ def ocr_document(
                 blocks=blocks,
                 page_height=page_height,
             )
+            # страница с таблицами из запасного TATR — с другой meta: следующий прогон того же PDF
+            # (сервис кладёт страницы по имени файла) не возьмёт её, а распознает через vLLM заново
+            page_meta = {**meta, "tables": "tatr"} if page_number in tatr_fallback_pages else meta
             with timer.step(page_number, "сохранение страницы"):
-                _save_page(page_file, page, meta)
+                _save_page(page_file, page, page_meta)
             pages.append(page)
             report(page_number, total, page_number, "готово")
 

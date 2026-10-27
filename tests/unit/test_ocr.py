@@ -1911,3 +1911,17 @@ def test_ocr_document_vlm_unavailable_falls_back_to_tatr_for_rest_of_document(tm
     assert all(p.ocr_applied for p in result.pages)
     steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
     assert any(s.startswith("таблицы: vLLM недоступен, запасной путь TATR") for s in steps)
+
+    # следующий прогон того же PDF (vLLM уже поднялся) не берёт страницы запасного пути из
+    # сохранённых, а распознаёт их через vLLM
+    chat_ok = []
+    ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        table_engine="vlm",
+        vlm_chat_fn=lambda _img: chat_ok.append(1) or "",
+        image_data_fn=lambda _p: _tesseract_data([("Текст", 95, 10, 10, 100, 20)]),
+        auto_rotate=False,
+        progress_fn=lambda *a: None,
+    )
+    assert len(chat_ok) == 2
