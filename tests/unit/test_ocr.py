@@ -1838,6 +1838,37 @@ def test_ocr_document_vlm_engine_tables_and_text_without_duplicates(tmp_path: Pa
     assert "таблицы: DeepSeek-OCR (vLLM)" in steps and "таблицы: сетка по линиям" in steps
 
 
+@pytest.mark.skipif(not _has_tesseract(), reason="нет Tesseract")
+def test_ocr_document_vlm_engine_rereads_doubtful_cells(tmp_path: Path):
+    """565 стр. 7: сомнительные ячейки сетки дочитываются по кропу (vlm_ask_fn); принятый текст —
+    в ячейке без жёлтой пометки, время — отдельным шагом timings."""
+    page_png = ROTATION_PAGES / "565_p007.png"
+    raw = (ROTATION_PAGES / "565_p007.txt").read_text(encoding="utf-8")
+    pdf_path = _pdf_from_page_image(tmp_path / "scan.pdf", page_png)
+    asked = []
+
+    def ask(img, prompt):
+        asked.append(prompt)
+        return "мг/нм³", "stop", -0.05
+
+    result = ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        table_engine="vlm",
+        vlm_chat_fn=lambda _img: raw,
+        vlm_ask_fn=ask,
+        image_data_fn=lambda _p: _tesseract_data([("Текст", 95, 10, 10, 100, 20)]),
+        auto_rotate=False,
+        progress_fn=lambda *a: None,
+    )
+    assert asked
+    (table,) = [b for b in result.pages[0].blocks if isinstance(b, TableBlock)]
+    reread = [c for c in table.cells if c.text == "мг/нм³"]
+    assert reread and not any(any(c.low_lines) for c in reread)
+    steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
+    assert "таблицы: дочитка ячеек (vLLM)" in steps
+
+
 def test_ocr_document_vlm_unavailable_falls_back_to_tatr_for_rest_of_document(tmp_path: Path, monkeypatch):
     """vLLM не ответил — документ не падает: таблицы через TATR, vLLM больше не спрашиваем
     (не ждём таймаут на каждой странице), причина — в шагах timings."""

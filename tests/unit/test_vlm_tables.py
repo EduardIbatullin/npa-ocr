@@ -1,19 +1,22 @@
 """Тесты таблиц через DeepSeek-OCR + сетку по линиям (vlm_tables.py) — на сохранённых ответах
 DeepSeek-OCR и страницах спайка npa-vlm-ocr, без GPU. Ожидаемые таблицы — итог спайка, проверенный
-разметкой (docs/review_marks_*.json там же); ячейки, которые в спайке дочитаны VLM по кропу
-(этап 5 плана встраивания), здесь не сравниваются.
+разметкой (docs/review_marks_*.json там же). Ячейки, которые в спайке дочитаны VLM по кропу
+(этап 5 плана встраивания), сравниваются только с дочиткой — на ответах модели, записанных на
+живом vLLM (<key>.reread.json).
 
 Сетка использует настоящий Tesseract (как и в работе), поэтому тесты на страницах пропускаются,
 если его нет."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
 
 import pytest
 
+from npa_ocr.vlm_reread import reread_cells
 from npa_ocr.vlm_tables import cell_text, html_cells, parse_deepseek, run_vlm_tables
 
 FIXTURES = Path(__file__).parent / "fixtures" / "vlm_tables"
@@ -33,9 +36,27 @@ def _has_tesseract() -> bool:
 needs_tesseract = pytest.mark.skipif(not _has_tesseract(), reason="нет Tesseract или OpenCV")
 
 
-def _run(key: str):
+def _run(key: str, reread_fn=None):
     raw = (FIXTURES / f"{key}.txt").read_text(encoding="utf-8")
-    return run_vlm_tables(FIXTURES / f"{key}.png", chat_fn=lambda _img: raw)
+    return run_vlm_tables(FIXTURES / f"{key}.png", chat_fn=lambda _img: raw, reread_fn=reread_fn)
+
+
+def _replay_ask(key: str):
+    """Ответы DeepSeek-OCR на кропы ячеек, записанные на живом vLLM: sha1 пикселей кропа + промпт
+    (не байтов PNG — они зависят от версии кодировщика). Какие ячейки сомнительны, зависит и от
+    версии Tesseract (Windows-сборка читает «H₂SO₄» в 191 стр. 14 как «Н›$О1», и ячейка становится
+    сомнительной, а 5.5 в образе — нет): на незаписанный кроп — негодный ответ, ячейка остаётся как есть."""
+    answers = json.loads((FIXTURES / f"{key}.reread.json").read_text(encoding="utf-8"))
+
+    def ask(img, prompt: str):
+        digest = hashlib.sha1(f"{img.mode}{img.size}".encode() + img.tobytes()).hexdigest()
+        text, reason, lp = answers.get(digest + "|" + prompt, ("", "stop", -9.0))
+        return text, reason, lp
+
+    return ask
+
+
+REREAD_PAGES = sorted(p.name.removesuffix(".reread.json") for p in FIXTURES.glob("*.reread.json"))
 
 
 def _grid(table) -> dict[tuple[int, int], str]:
@@ -105,6 +126,24 @@ def test_page_matches_spike(key: str):
         for r, c, _, _, text, by_vlm in e["cells"]:
             if not by_vlm:
                 assert texts[(r, c)] == text, (r, c)
+
+
+@needs_tesseract
+@pytest.mark.parametrize("key", REREAD_PAGES)
+def test_page_with_reread_matches_spike(key: str):
+    """С дочиткой сомнительных ячеек (этап 5) итог совпадает со спайком во всех ячейках, включая
+    дочитанные; дочитанные — без жёлтой пометки."""
+    ask = _replay_ask(key)
+    expected = json.loads((FIXTURES / f"{key}.json").read_text(encoding="utf-8"))
+    got = _run(key, reread_fn=lambda crop, doubt: reread_cells(crop, doubt, ask))
+    assert len(got) == len(expected)
+    for t, e in zip(got, expected):
+        assert (t.n_rows, t.n_cols) == (e["n_rows"], e["n_cols"])
+        cells = {(c.row, c.col): c for c in t.cells}
+        for r, c, _, _, text, by_vlm in e["cells"]:
+            assert cells[(r, c)].text == text, (r, c)
+            if by_vlm:
+                assert not any(cells[(r, c)].low_lines), (r, c)
 
 
 @needs_tesseract

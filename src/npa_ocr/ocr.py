@@ -46,7 +46,7 @@ from typing import Callable, Iterable, Iterator
 import pypdf
 from PIL import Image
 
-from npa_ocr import ai_escalation, mark_detection, table_stitch, table_structure, vlm_tables
+from npa_ocr import ai_escalation, mark_detection, table_stitch, table_structure, vlm_reread, vlm_tables
 from npa_ocr.ocr_table import TableCell, normalize_header_text, reconstruct_table
 from npa_ocr.table_structure import TableStructure
 
@@ -1157,13 +1157,16 @@ def run_vlm_table_blocks(
     image_path: Path,
     chat_fn: Callable[[Image.Image], str],
     *,
+    ask_fn: "vlm_reread.AskFn | None" = None,
     timer: "StepTimer | None" = None,
     page: int | None = None,
 ) -> list[TableBlock]:
     """Таблицы страницы через DeepSeek-OCR + сетку по линиям (vlm_tables.py) в виде TableBlock.
-    Ячейки «только Tesseract» и «по положению» уже помечены low_lines — в DOCX жёлтые.
-    vlm_tables.VlmUnavailable пробрасывается: запасной путь решает вызывающий."""
+    Сомнительные ячейки дочитываются по кропу (vlm_reread.py, ask_fn — инъекция модели; None —
+    без дочитки). Недочитанные ячейки «только Tesseract» и «по положению» помечены low_lines — в
+    DOCX жёлтые. vlm_tables.VlmUnavailable пробрасывается: запасной путь решает вызывающий."""
     chat_seconds = [0.0]
+    reread_seconds = [0.0]
 
     def timed_chat(img: Image.Image) -> str:
         t0 = time.perf_counter()
@@ -1172,12 +1175,23 @@ def run_vlm_table_blocks(
         finally:
             chat_seconds[0] = time.perf_counter() - t0
 
+    def timed_reread(crop: Image.Image, doubt: list[dict]) -> dict[tuple[int, int], str]:
+        t0 = time.perf_counter()
+        try:
+            return vlm_reread.reread_cells(crop, doubt, ask_fn)
+        finally:
+            reread_seconds[0] += time.perf_counter() - t0
+
     t0 = time.perf_counter()
-    tables = vlm_tables.run_vlm_tables(image_path, chat_fn=timed_chat)
+    tables = vlm_tables.run_vlm_tables(
+        image_path, chat_fn=timed_chat, reread_fn=timed_reread if ask_fn is not None else None
+    )
     elapsed = time.perf_counter() - t0
     if timer is not None:
         timer.add(page, "таблицы: DeepSeek-OCR (vLLM)", chat_seconds[0])
-        timer.add(page, "таблицы: сетка по линиям", elapsed - chat_seconds[0])
+        timer.add(page, "таблицы: сетка по линиям", elapsed - chat_seconds[0] - reread_seconds[0])
+        if reread_seconds[0]:
+            timer.add(page, "таблицы: дочитка ячеек (vLLM)", reread_seconds[0])
     return [
         TableBlock(
             y=float(t.bbox[1]),
@@ -1919,6 +1933,7 @@ def ocr_document(
     auto_rotate: bool = True,
     orientation_fn: Callable[[Path], int] | None = None,
     vlm_chat_fn: Callable[[Image.Image], str] | None = None,
+    vlm_ask_fn: "vlm_reread.AskFn | None" = None,
 ) -> OcrDocumentResult:
     """Точка входа этапа 3. Постранично: если у страницы уже есть текстовый слой
     (>= min_page_text_chars символов) — используется он как есть, OCR не
@@ -1937,7 +1952,8 @@ def ocr_document(
     скане. Повёрнутое изображение идёт и в таблицы, и в Tesseract.
 
     table_engine="vlm" — таблицы через DeepSeek-OCR в vLLM на GPU (vlm_tables.py,
-    vlm_chat_fn — инъекция модели); если vLLM не ответил — до конца документа TATR. Таблицы,
+    vlm_chat_fn — инъекция модели); сомнительные ячейки дочитываются по кропу (vlm_reread.py,
+    vlm_ask_fn — инъекция модели). Если vLLM не ответил — до конца документа TATR. Таблицы,
     продолжающиеся на следующей странице, при этом сшиваются в одну (stitch_tables).
 
     predict_tables_fn/image_data_fn — инъекция движков; по умолчанию настоящие
@@ -1979,6 +1995,9 @@ def ocr_document(
             "auto_rotate": auto_rotate,
             "pdf_size": pdf_path.stat().st_size,
         }
+        if table_engine == "vlm":
+            # версия пути vlm: 2 — с дочиткой ячеек; страницы прежних прогонов пересчитываются
+            meta["vlm_version"] = 2
         if orientation_fn is None:
             orientation_fn = _default_orientation_fn
         reader = pypdf.PdfReader(str(pdf_path))
@@ -1991,6 +2010,7 @@ def ocr_document(
     cell_text_fn: Callable | None = None
     vlm_down: str | None = None  # table_engine="vlm": причина, по которой vLLM недоступен
     vlm_chat_fn = vlm_chat_fn or vlm_tables.deepseek_chat
+    vlm_ask_fn = vlm_ask_fn or vlm_reread.deepseek_ask
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i, (pdf_page, fitz_page) in enumerate(zip(reader.pages, fitz_doc)):
             page_number = i + 1
@@ -2073,7 +2093,7 @@ def ocr_document(
                 nonlocal vlm_down
                 if vlm_down is None:
                     try:
-                        return run_vlm_table_blocks(path, vlm_chat_fn, timer=timer, page=_page)
+                        return run_vlm_table_blocks(path, vlm_chat_fn, ask_fn=vlm_ask_fn, timer=timer, page=_page)
                     except vlm_tables.VlmUnavailable as exc:
                         vlm_down = str(exc)
                         print(f"{exc} — таблицы через TATR до конца документа", file=sys.stderr, flush=True)

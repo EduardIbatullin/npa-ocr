@@ -19,7 +19,8 @@ DeepSeek-OCR по всей странице отдаёт блоки «<|ref|>tab
 Если сетка не построилась или не вместила текст DeepSeek (таблица без линий в теле,
 Постановление №1430) — берётся HTML DeepSeek как есть. Ячейки, где текст есть только от
 Tesseract или поставлен лишь по положению, помечаются низкой уверенностью (low_lines) —
-DOCX подсвечивает их жёлтым.
+DOCX подсвечивает их жёлтым. Такие ячейки (и «чернила» без текста, и текст DeepSeek, не похожий
+на Tesseract) дочитываются по кропу ячейки — vlm_reread.py; принятый текст пометку снимает.
 
 Сетевой адрес vLLM — переменная окружения VLLM_URL (OpenAI-совместимый /v1), модель —
 VLLM_MODEL (served-model-name в vLLM). В сервисе это адрес шлюза vlm_gate.py: он поднимает
@@ -627,6 +628,44 @@ class GridResult:
     n_rows: int
     n_cols: int
     info: dict                    # ds_cells, ds_lost, ds_invented, tess_only, by_pos, split, why
+    # сомнительные ячейки для дочитки (vlm_reread.py): r, c, box (в координатах кропа), rot, tess,
+    # left (соседняя слева ячейка с текстом DeepSeek: box, text), kind (tess|empty|mismatch), ds
+    doubt: list[dict] = field(default_factory=list)
+
+
+def _plain(h: str) -> str:
+    return " ".join(re.sub(r"<[^>]+>", " ", h).split())
+
+
+def _doubt_kind(c: _Cell) -> str | None:
+    """Сомнительная ячейка: текст только от Tesseract, «чернила» без текста или текст DeepSeek, не
+    похожий на то, что видит Tesseract (228 стр. 25: вертикальную шапку DeepSeek прочла плохо — «для
+    управления» вместо «для утилизации»)."""
+    if c.src == "tess":
+        return "tess"
+    if c.ink and not c.text:
+        return "empty"
+    # вертикальный текст (Tesseract прочёл его с поворотом) DeepSeek читает заметно хуже: «для
+    # обращения» вместо «для обработки» — там проверяем любое расхождение
+    if c.src in ("ds", "pos") and _letters(c.tess) >= 4 and sim(c.tess, _plain(c.text)) < (0.95 if c.rot else 0.5):
+        return "mismatch"
+    return None
+
+
+def _doubt(cells: list[_Cell]) -> list[dict]:
+    def left_of(c: _Cell) -> dict | None:
+        """Соседняя слева ячейка с текстом DeepSeek — контекст для дочитки."""
+        k = next((x for x in cells if x.c + x.cs == c.c and x.r <= c.r < x.r + x.rs and x.src in ("ds", "pos")),
+                 None)
+        return {"box": [k.x0, k.y0, k.x1, k.y1], "text": _plain(k.text)} if k else None
+
+    out = []
+    for c in cells:
+        kind = _doubt_kind(c)
+        if kind:
+            out.append({"r": c.r, "c": c.c, "box": [c.x0, c.y0, c.x1, c.y1], "rot": c.rot, "tess": c.tess,
+                        "left": left_of(c), "kind": kind, "ds": _plain(c.text) if kind == "mismatch" else ""})
+    return out
 
 
 def rebuild(img: Image.Image, ds_html: str) -> GridResult:
@@ -649,6 +688,7 @@ def rebuild(img: Image.Image, ds_html: str) -> GridResult:
         elif c.tess:
             c.text, c.src = escape(c.tess), "tess"
     n_split = _split_values(cells, ds)
+    doubt = _doubt(cells)
     lost = [ds[j].text for j in range(len(ds)) if not any(j in c.ds_ids for c in cells)]
     # повтор уже размещённого текста (DeepSeek дублирует «кг/т переработанного сырья» в выдуманных
     # строках) — не потеря; потеря — текст, которого в итоговой таблице нет вовсе
@@ -668,7 +708,20 @@ def rebuild(img: Image.Image, ds_html: str) -> GridResult:
         low = c.src in ("tess", "pos")
         out.append(TableCell(c.r, c.c, c.rs, c.cs, text,
                              (True,) * len(text.split("\n")) if low and text else ()))
-    return GridResult(True, out, info["n_rows"], info["n_cols"], info)
+    return GridResult(True, out, info["n_rows"], info["n_cols"], info, doubt)
+
+
+# (кроп таблицы, сомнительные ячейки GridResult.doubt) -> принятый текст по (строка, столбец)
+RereadFn = Callable[[Image.Image, list[dict]], dict[tuple[int, int], str]]
+
+
+def apply_reread(cells: list[TableCell], texts: dict[tuple[int, int], str]) -> list[TableCell]:
+    """Дочитанный текст — в ячейки; он проверен (vlm_reread.accept), поэтому без жёлтой пометки."""
+    out = []
+    for c in cells:
+        t = texts.get((c.row, c.col))
+        out.append(c if t is None else TableCell(c.row, c.col, c.row_span, c.col_span, cell_text(escape(t))))
+    return out
 
 
 def html_cells(html: str) -> tuple[list[TableCell], int, int]:
@@ -742,9 +795,10 @@ class VlmTable:
     info: dict = field(default_factory=dict)
 
 
-def page_tables(page: Image.Image, tables: list[DsTable]) -> list[VlmTable]:
+def page_tables(page: Image.Image, tables: list[DsTable], reread_fn: RereadFn | None = None) -> list[VlmTable]:
     """Таблицы DeepSeek страницы -> итоговые таблицы. Таблицы DeepSeek, попавшие в одну разлиновку,
-    — одна таблица (1430 стр. 8: разрезана на две по строке-подзаголовку «II. При сбросе…»)."""
+    — одна таблица (1430 стр. 8: разрезана на две по строке-подзаголовку «II. При сбросе…»).
+    reread_fn — дочитка сомнительных ячеек таблиц по сетке (vlm_reread.reread_cells)."""
     boxes = [refine_bbox(page, t.bbox) for t in tables]
     groups: list[list[int]] = []
     for k, b in enumerate(boxes):
@@ -758,11 +812,17 @@ def page_tables(page: Image.Image, tables: list[DsTable]) -> list[VlmTable]:
         box = [min(boxes[i][0] for i in g), min(boxes[i][1] for i in g),
                max(boxes[i][2] for i in g), max(boxes[i][3] for i in g)]
         html = "<table>" + "".join(re.sub(r"</?table[^>]*>", "", tables[i].html) for i in g) + "</table>"
-        res = rebuild(page.crop(box), html)
+        crop = page.crop(box)
+        res = rebuild(crop, html)
         # итог: сетка по линиям, если она вместила текст DeepSeek; иначе (таблица без линий в теле,
         # как 1430 стр. 8, или сетка не построилась) — HTML DeepSeek как есть
         if res.ok and res.info["ds_lost"] <= _MAX_LOST_SHARE * max(res.info["ds_cells"], 1):
-            out.append(VlmTable(box, res.cells, res.n_rows, res.n_cols, "grid", html, res.info))
+            cells = res.cells
+            if reread_fn is not None and res.doubt:
+                texts = reread_fn(crop, res.doubt)
+                cells = apply_reread(cells, texts)
+                res.info.update(doubt=len(res.doubt), by_vlm=len(texts))
+            out.append(VlmTable(box, cells, res.n_rows, res.n_cols, "grid", html, res.info))
         else:
             cells, n_rows, n_cols = html_cells(html)
             out.append(VlmTable(box, cells, n_rows, n_cols, "deepseek", html, res.info))
@@ -817,9 +877,15 @@ def extend_to_rows(page: Image.Image, box: list[int], cells: list[TableCell], li
     return [x0, y0, x1, min(page.height, bottom + pad) if bottom > y1 else y1]
 
 
-def run_vlm_tables(image_path: Path, *, chat_fn: Callable[[Image.Image], str] = deepseek_chat) -> list[VlmTable]:
-    """Таблицы страницы-скана: DeepSeek-OCR по всей странице + сетка по линиям.
-    chat_fn — инъекция модели (в тестах — сохранённые ответы DeepSeek)."""
+def run_vlm_tables(
+    image_path: Path,
+    *,
+    chat_fn: Callable[[Image.Image], str] = deepseek_chat,
+    reread_fn: RereadFn | None = None,
+) -> list[VlmTable]:
+    """Таблицы страницы-скана: DeepSeek-OCR по всей странице + сетка по линиям (+ дочитка
+    сомнительных ячеек, если задан reread_fn). chat_fn — инъекция модели (в тестах — сохранённые
+    ответы DeepSeek)."""
     page = Image.open(image_path).convert("RGB")
     raw = chat_fn(page)
-    return page_tables(page, parse_deepseek(raw, page.width, page.height))
+    return page_tables(page, parse_deepseek(raw, page.width, page.height), reread_fn)
