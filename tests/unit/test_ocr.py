@@ -1992,3 +1992,31 @@ def test_ocr_document_marks_unavailable_keeps_text(tmp_path: Path):
     assert any("ЗАРЕГИСТРИРОВАНО" in t for t in texts)
     steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
     assert any(s.startswith("метки: Ollama недоступна") for s in steps)
+
+
+def test_ocr_document_vlm_engine_rereads_formulas_and_variables(tmp_path: Path):
+    """710 стр. 3: второе прочтение ответом DeepSeek на страницу (тот же, что для таблиц) — формула
+    отдельным блоком, «статьи 163» → 16³, K с индексом; шаг в таймингах."""
+    from npa_ocr.ocr import FormulaBlock
+
+    pages = Path(__file__).parent / "fixtures" / "vlm_text"
+    data = json.loads((pages / "710_p003.tess.json").read_text(encoding="utf-8"))
+    ds = (pages / "710_p003.ds.txt").read_text(encoding="utf-8")
+    png = tmp_path / "page.png"
+    Image.new("L", (data["width"][0], data["height"][0]), 255).save(png)
+    result = ocr_document(
+        _pdf_from_page_image(tmp_path / "scan.pdf", png),
+        tmp_path / "out.docx",
+        table_engine="vlm",
+        vlm_chat_fn=lambda _img: ds,
+        image_data_fn=lambda _p: data,
+        auto_rotate=False,
+        progress_fn=lambda *a: None,
+    )
+    blocks = result.pages[0].blocks
+    assert [b.latex for b in blocks if isinstance(b, FormulaBlock)] == [r"Z = \frac{S}{V} \times 100\%,"]
+    texts = [b.text for b in blocks if isinstance(b, TextBlock)]
+    assert "Федерации в соответствии с пунктом 4 статьи 16³ Федерального закона" in texts
+    assert any("(К<sub>нмм</sub>)," in b.rich_words for b in blocks if isinstance(b, TextBlock))
+    steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
+    assert "текст: второе прочтение DeepSeek" in steps

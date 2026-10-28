@@ -82,6 +82,7 @@ class Word:
     conf: float  # уверенность Tesseract, 0–100
     box: Box
     restored: bool = False  # текст заменён по DeepSeek или дописан по названию органа
+    rich: str = ""  # разметка DeepSeek для DOCX: <sub>/<sup>, \(LaTeX\) (vlm_text.py); пусто — как text
 
 
 # --- Поиск меток (qwen3-vl) ---

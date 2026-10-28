@@ -64,6 +64,12 @@ npa-ocr scan.pdf --out result.docx --no-auto-rotate              # не пово
 `vlm-gate` в docker-compose npa-downloader. Для HTTP API движок задаёт переменная
 `NPA_OCR_TABLE_ENGINE` сервиса (по умолчанию `tatr`).
 
+С `vlm` текст страницы сверяется с тем же ответом DeepSeek-OCR (`src/npa_ocr/vlm_text.py`):
+римские цифры («П категории» → «II категории»), латинские переменные, индексы и степени
+(«статьи 163» → «16³», «Кир» → «K<sub>пр</sub>») берутся у DeepSeek, а русский текст остаётся
+за Tesseract. Формулы идут в DOCX настоящими формулами Word, через LaTeX → MathML → OMML
+(`src/npa_ocr/docx_math.py`). Индексы — подстрочным и надстрочным шрифтом.
+
 Страницы-сканы перед распознаванием поворачиваются по Tesseract OSD (альбомные
 таблицы, лежащие на боку); `--no-auto-rotate` отключает поворот.
 
