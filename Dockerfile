@@ -1,4 +1,6 @@
-FROM python:3.12-slim
+# Точная версия Python и Debian (trixie — Tesseract 5.5.0): плавающий 3.12-slim при сборке
+# с нуля мог бы сменить Debian, а с ним и Tesseract.
+FROM python:3.12.15-slim-trixie
 
 # Tesseract с русским языком; libgomp/libgl — для PaddlePaddle и OpenCV
 RUN apt-get update \
@@ -32,7 +34,13 @@ WORKDIR /app
 # PyTorch CPU-сборка (иначе pip тянет CUDA-колёса в несколько гигабайт).
 # torch и torchvision ставятся одной командой из одного индекса: torchvision из PyPI
 # не совместим с CPU-сборкой torch (ошибка "operator torchvision::nms does not exist")
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Версии всех пакетов — из constraints.txt (проверенный набор): иначе сборка с нуля тянет
+# свежие версии, и образ может не собраться или распознавать иначе. PyPI — запасной индекс
+# для зависимостей torch, закреплённых версий которых нет в индексе PyTorch; сами torch
+# и torchvision «+cpu» есть только в индексе PyTorch.
+COPY constraints.txt ./
+RUN pip install --no-cache-dir -c constraints.txt torch torchvision \
+    --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
 
 # Зависимости отдельно — слой кэшируется при неизменном pyproject.toml.
 # server — HTTP API (npa_ocr.server), см. README, «HTTP API».
@@ -41,7 +49,7 @@ RUN pip install --no-cache-dir torch torchvision --index-url https://download.py
 # editable — пакет читается из /app/src, настоящий код ложится туда ниже.
 COPY pyproject.toml ./
 RUN mkdir -p src/npa_ocr && touch src/npa_ocr/__init__.py README.md \
-    && pip install --no-cache-dir -e ".[models,server]"
+    && pip install --no-cache-dir -c constraints.txt -e ".[models,server]"
 COPY README.md ./
 COPY src ./src
 
