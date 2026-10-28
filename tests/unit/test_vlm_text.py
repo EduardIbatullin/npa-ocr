@@ -63,6 +63,20 @@ def test_roman_only_over_lookalike_tesseract_word():
     assert not _accept(["I."], [Word("г.", 90, (0, 0, 10, 10))])
 
 
+def test_roman_range_over_lookalike_tesseract_word():
+    """Диапазон классов опасности Tesseract пишет слитно и теряет знаки (228)."""
+    w = lambda t: [Word(t, 90, (0, 0, 10, 10))]  # noqa: E731
+    for tess, ds in [("ГУ", "I–V"), ("[-У", "I–V"), ("ЕП", "I–II"), ("Г", "I-II"), ("1-П", "I–II"),
+                     ("Г-П", "I–II"), ("ГП", "I–II")]:
+        assert _accept([ds], w(tess)), tess
+    assert not _accept(["I–II"], w("ГПУ"))  # длиннее диапазона
+    assert not _accept(["I–V"], w("Гм"))  # русская буква
+
+
+def test_markdown_heading_marks_are_not_words():
+    assert tokens("## II. Методы определения") == ["II.", "Методы", "определения"]
+
+
 def test_latin_letter_not_over_its_cyrillic_twin_or_translit():
     assert not _accept(["K"], [Word("К", 90, (0, 0, 10, 10))])  # двойник: вернее Tesseract
     assert not _accept(["i"], [Word("и", 90, (0, 0, 10, 10))])  # транслит
@@ -99,6 +113,28 @@ def test_roman_numerals_classes_of_hazard():
     """228 стр. 11: «ГУ и У классов опасности» → «IV и V»."""
     _, out, _ = _reread("228_p011")
     assert "производства черных металлов IV и V классов опасности, золошлаковых отходов" in _texts(out)
+
+
+def test_roman_ranges_and_headings_228():
+    """228: диапазоны классов опасности «[-У», «ГУ», «ЕП», «1-П», «Г-П», «ГП» → «I–V», «I–II»; заголовки
+    «П.», «Ш.» и «главы П» → II, III."""
+    expect = {
+        "228_p003": ["деятельность по образованию и обращению с отходами I–V классов опасности,"],
+        "228_p004": ["II. Методы определения (расчета) нормативов"],
+        "228_p007": ["III. Содержание и оформление НООЛР"],
+        "228_p009": ["I–V классов опасности к конкретному классу опасности, предусмотренным",
+                     "главы II Методических указаний."],
+        "228_p012": ["указания наименования вида отходов I–II класса опасности",
+                     "имеющего статус федерального оператора по обращению с отходами I–II классов"],
+        "228_p017": ["указания наименования вида отходов I–II класса опасности",
+                     "имеющего статус федерального оператора по обращению с отходами I–II классов",
+                     "с отходами I и II классов опасности, заключенного с ним."],
+        "228_p019": ["указания наименования вида отходов I–II класса опасности"],
+    }
+    for key, want in expect.items():
+        texts = _texts(_reread(key)[1])
+        for line in want:
+            assert line in texts, (key, line)
 
 
 def test_superscripts_variables_and_formula_block():

@@ -39,6 +39,8 @@ from npa_ocr.vlm_marks import Box, Word, ds_blocks
 _TOKEN_RE = re.compile(r"\S*?\\\(.*?\\\)\S*|\S*?<su[bp]>.*?</su[bp]>(?:\S*?<su[bp]>.*?</su[bp]>)*\S*|\S+")
 _TAG_RE = re.compile(r"</?su[bp]>")
 _ROMAN_RE = re.compile(r"^[IVXLC]{1,6}$")
+# диапазон классов опасности «I–V», «I-II» (228 стр. 3, 9, 12)
+_ROMAN_RANGE_RE = re.compile(r"^[IVXLC]{1,4}[-–—][IVXLC]{1,4}$")
 _LATIN_VAR_RE = re.compile(r"^[A-Za-z]{1,3}(-[а-яё]{1,3})?$")
 _LIST_MARKER_RE = re.compile(r"^[a-z]\)$")
 _SUP_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
@@ -53,6 +55,8 @@ _TRANSLIT = {"a": "а", "b": "б", "v": "в", "g": "г", "d": "д", "e": "е", "
 # как Tesseract с русским словарём пишет римские цифры
 _ROMAN_LOOKALIKE = str.maketrans({"П": "II", "Ш": "III", "У": "V", "Г": "I", "Т": "I", "[": "I", "]": "I",
                                   "|": "I", "1": "I", "l": "I", "!": "I", "Н": "II", "Х": "X", "\\": ""})
+# диапазон Tesseract пишет слитно и с потерей знаков: «I–IV» → «ГУ», «I–II» → «ЕП», «Г», «[-П», «1-П»
+_ROMAN_RANGE_LOOKALIKE = "ПШУГТ[]|1l!НХЕ-–—"
 _PUNCT = ".,;:()«»\"'’"
 # индексы, которые DeepSeek пишет символами Юникода («Sᵢᵏ», 710 стр. 12) — в разметку <sub>/<sup>
 _UNI_SUB = dict(zip("ᵢⱼₐₑₒₓₕₖₗₘₙₚₛₜᵣᵤᵥ₀₁₂₃₄₅₆₇₈₉", "ijaeoxhklmnpstruv0123456789"))
@@ -121,6 +125,8 @@ def _kind(token: str) -> str | None:
     core = _core(token)
     if _ROMAN_RE.match(core):
         return "roman"
+    if _ROMAN_RANGE_RE.match(core):
+        return "roman_range"
     if _LATIN_VAR_RE.match(core):
         return "latin"
     return None
@@ -171,6 +177,14 @@ def _accept(ds: list[str], tess: list[Word]) -> bool:
             looks = re.sub(r"[^IVXLC]", "", tess_joined.strip(_PUNCT).translate(_ROMAN_LOOKALIKE))
             if looks != core:
                 return False
+        elif k == "roman_range":
+            # слово Tesseract — только из похожих на римские цифры знаков и не длиннее диапазона:
+            # сколько I в «I–II» уцелело, по скану не проверить — верим DeepSeek
+            body = tess_joined.strip(_PUNCT)
+            if len(tess) > 2 or not body or any(c not in _ROMAN_RANGE_LOOKALIKE for c in body):
+                return False
+            if len(re.sub(r"[-–—]", "", body.translate(_ROMAN_LOOKALIKE))) > len(core) - 1:
+                return False
         elif k == "latin":
             letters = re.sub(r"[^A-Za-z]", "", core)
             if len(letters) <= 1 and letters in _HOMOGLYPHS:
@@ -201,7 +215,8 @@ def _span_words(tess: list[Word], ds: list[str]) -> list[Word]:
 
 
 def tokens(text: str) -> list[str]:
-    return [_markup(t) for t in _TOKEN_RE.findall(text.replace("<br>", " "))]
+    """Слова блока DeepSeek; «##» заголовка Markdown — не слово («## II. Методы…», 228 стр. 4)."""
+    return [_markup(t) for t in _TOKEN_RE.findall(text.replace("<br>", " ")) if t.strip("#")]
 
 
 def reread_lines(lines: list[list[Word]], ds_raw: str | None, width: int, height: int
