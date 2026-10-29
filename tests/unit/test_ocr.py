@@ -1925,3 +1925,98 @@ def test_ocr_document_vlm_unavailable_falls_back_to_tatr_for_rest_of_document(tm
         progress_fn=lambda *a: None,
     )
     assert len(chat_ok) == 2
+
+
+MARKS_PAGES = Path(__file__).parent / "fixtures" / "vlm_marks"
+
+
+def _marks_page_pdf(tmp_path: Path, key: str) -> tuple[Path, dict]:
+    """Скан из белой страницы того же размера, что страница спайка (вид страницы не нужен: слова
+    Tesseract, ответы DeepSeek и qwen3-vl — записанные фикстуры vlm_marks)."""
+    data = json.loads((MARKS_PAGES / f"{key}.tess.json").read_text(encoding="utf-8"))
+    png = tmp_path / "page.png"
+    Image.new("L", (data["width"][0], data["height"][0]), 255).save(png)
+    return _pdf_from_page_image(tmp_path / "scan.pdf", png), data
+
+
+def test_ocr_document_vlm_engine_drops_marks_text(tmp_path: Path):
+    """Приказ №215 стр. 1: текст штампа Минюста и подписи выкидывается, шапка под краем штампа
+    дописывается по authority_name, фамилия под росчерком — по DeepSeek; время qwen3-vl — шагом."""
+    pdf_path, data = _marks_page_pdf(tmp_path, "215_p001")
+    ds = (MARKS_PAGES / "215_p001.ds.txt").read_text(encoding="utf-8")
+    qwen = (MARKS_PAGES / "215_p001.qwen.txt").read_text(encoding="utf-8")
+    result = ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        table_engine="vlm",
+        use_ai_escalation=True,
+        authority_name="Министерство природных ресурсов и экологии Российской Федерации",
+        vlm_chat_fn=lambda _img: ds,
+        marks_ask_fn=lambda _img: qwen,
+        image_data_fn=lambda _p: data,
+        auto_rotate=False,
+        progress_fn=lambda *a: None,
+    )
+    texts = [b.text for b in result.pages[0].blocks if isinstance(b, TextBlock)]
+    assert "МИНИСТЕРСТВО ПРИРОДНЫХ РЕСУРСОВ И ЭКОЛОГИИ" in texts
+    assert "Министр А.А. Козлов" in texts
+    assert not [t for t in texts if "ЗАРЕГИСТРИРОВАНО" in t or "ЮСТИЦИИ" in t]
+    header = texts.index("МИНИСТЕРСТВО ПРИРОДНЫХ РЕСУРСОВ И ЭКОЛОГИИ")
+    assert result.pages[0].blocks[header].low_words[-2:] == (True, True)  # дописанное — на проверку
+    steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
+    assert "метки: qwen3-vl (Ollama)" in steps
+
+
+def test_ocr_document_marks_unavailable_keeps_text(tmp_path: Path):
+    """Ollama не ответила — страница распознаётся без чистки меток, документ не падает."""
+    from npa_ocr.vlm_marks import MarksUnavailable
+
+    pdf_path, data = _marks_page_pdf(tmp_path, "215_p001")
+    ds = (MARKS_PAGES / "215_p001.ds.txt").read_text(encoding="utf-8")
+
+    def down(_img):
+        raise MarksUnavailable("Ollama недоступна: 503")
+
+    result = ocr_document(
+        pdf_path,
+        tmp_path / "out.docx",
+        table_engine="vlm",
+        use_ai_escalation=True,
+        vlm_chat_fn=lambda _img: ds,
+        marks_ask_fn=down,
+        image_data_fn=lambda _p: data,
+        auto_rotate=False,
+        progress_fn=lambda *a: None,
+    )
+    texts = [b.text for b in result.pages[0].blocks if isinstance(b, TextBlock)]
+    assert any("ЗАРЕГИСТРИРОВАНО" in t for t in texts)
+    steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
+    assert any(s.startswith("метки: Ollama недоступна") for s in steps)
+
+
+def test_ocr_document_vlm_engine_rereads_formulas_and_variables(tmp_path: Path):
+    """710 стр. 3: второе прочтение ответом DeepSeek на страницу (тот же, что для таблиц) — формула
+    отдельным блоком, «статьи 163» → 16³, K с индексом; шаг в таймингах."""
+    from npa_ocr.ocr import FormulaBlock
+
+    pages = Path(__file__).parent / "fixtures" / "vlm_text"
+    data = json.loads((pages / "710_p003.tess.json").read_text(encoding="utf-8"))
+    ds = (pages / "710_p003.ds.txt").read_text(encoding="utf-8")
+    png = tmp_path / "page.png"
+    Image.new("L", (data["width"][0], data["height"][0]), 255).save(png)
+    result = ocr_document(
+        _pdf_from_page_image(tmp_path / "scan.pdf", png),
+        tmp_path / "out.docx",
+        table_engine="vlm",
+        vlm_chat_fn=lambda _img: ds,
+        image_data_fn=lambda _p: data,
+        auto_rotate=False,
+        progress_fn=lambda *a: None,
+    )
+    blocks = result.pages[0].blocks
+    assert [b.latex for b in blocks if isinstance(b, FormulaBlock)] == [r"Z = \frac{S}{V} \times 100\%,"]
+    texts = [b.text for b in blocks if isinstance(b, TextBlock)]
+    assert "Федерации в соответствии с пунктом 4 статьи 16³ Федерального закона" in texts
+    assert any("(К<sub>нмм</sub>)," in b.rich_words for b in blocks if isinstance(b, TextBlock))
+    steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
+    assert "текст: второе прочтение DeepSeek" in steps

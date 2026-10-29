@@ -46,7 +46,17 @@ from typing import Callable, Iterable, Iterator
 import pypdf
 from PIL import Image
 
-from npa_ocr import ai_escalation, mark_detection, table_stitch, table_structure, vlm_reread, vlm_tables
+from npa_ocr import (
+    ai_escalation,
+    docx_math,
+    mark_detection,
+    table_stitch,
+    table_structure,
+    vlm_marks,
+    vlm_reread,
+    vlm_tables,
+    vlm_text,
+)
 from npa_ocr.ocr_table import TableCell, normalize_header_text, reconstruct_table
 from npa_ocr.table_structure import TableStructure
 
@@ -67,7 +77,9 @@ UNRECOGNIZABLE_MARK = "[нрзб.]"
 class TextBlock:
     """Одна строка обычного текста (не в таблице). low_words — флаги низкой уверенности
     по словам text.split(); такие слова остаются в тексте и выделяются в DOCX.
-    x0/x1/height — геометрия строки (пиксели страницы) для абзацев и выравнивания."""
+    x0/x1/height — геометрия строки (пиксели страницы) для абзацев и выравнивания.
+    rich_words — по словам text.split(" ") разметка DeepSeek (vlm_text.py): <sub>/<sup>, \\(LaTeX\\);
+    пусто — слово как в text. В DOCX — подстрочный/надстрочный шрифт и формула Word."""
 
     y: float
     text: str
@@ -75,6 +87,17 @@ class TextBlock:
     x1: float = 0.0
     height: float = 0.0
     low_words: tuple[bool, ...] = ()
+    rich_words: tuple[str, ...] = ()
+
+
+@dataclass
+class FormulaBlock:
+    """Формула отдельной строкой (блок equation DeepSeek-OCR, LaTeX без \\[ \\]): в DOCX — формула
+    Word по центру. Строки Tesseract на её месте выкинуты (vlm_text.py)."""
+
+    y: float
+    latex: str
+    bbox: Box
 
 
 @dataclass
@@ -89,7 +112,7 @@ class TableBlock:
     dropped_columns: int = 0  # столбцы без текста, удалённые как артефакт структуры (TATR)
 
 
-PageBlock = TextBlock | TableBlock
+PageBlock = TextBlock | TableBlock | FormulaBlock
 
 
 @dataclass
@@ -293,7 +316,10 @@ def run_tesseract_text(
     authority_name: str | None = None,
     detect_marks_fn: Callable[[Path, list[Box]], list[mark_detection.Mark]] | None = None,
     recover_covered_text_fn: Callable[[Path], str] | None = None,
-) -> list[TextBlock]:
+    clean_marks_fn: Callable[[list[list[vlm_marks.Word]]], list[list[vlm_marks.Word]]] | None = None,
+    reread_text_fn: Callable[[list[list[vlm_marks.Word]]],
+                             tuple[list[list[vlm_marks.Word]], list[vlm_text.Formula]]] | None = None,
+) -> list[TextBlock | FormulaBlock]:
     """image_data_fn возвращает словарь формата pytesseract.image_to_data(...,
     output_type=Output.DICT) (ключи text/conf/left/top/width/height/block_num/
     par_num/line_num). Слова внутри table_bboxes пропускаются — та же область уже
@@ -318,9 +344,19 @@ def run_tesseract_text(
     типа «электронная_подпись»/«штамп_регистрации» с covers_text=False
     (собственное содержимое метки — не текст документа, а служебная отметка)
     исключаются из текста целиком, см. примеры (Постановление №710,
-    регистрационный штамп Минюста) в docs/plan.md."""
+    регистрационный штамп Минюста) в docs/plan.md.
+
+    clean_marks_fn — чистка меток по трём прочтениям (vlm_marks.py, путь table_engine="vlm"
+    вместо detect_marks_fn/recover_covered_text_fn): получает строки страницы словами с
+    уверенностью и рамками, возвращает их без текста штампов, печатей и подписей. Заменённые и
+    дописанные слова — неуверенные (жёлтые в DOCX).
+
+    reread_text_fn — второе прочтение ответом DeepSeek (vlm_text.py, после clean_marks_fn):
+    римские цифры, латинские переменные, индексы и степени (rich_words), формулы-блоки
+    (FormulaBlock на месте строк Tesseract)."""
     data = image_data_fn(image_path)
     lines: dict[tuple[int, int, int], list[tuple[float, float, str, float, float, bool]]] = {}
+    word_conf: dict[tuple[tuple[int, int, int], float, float], float] = {}  # для словесных правок
     for i in range(len(data["text"])):
         word = data["text"][i].strip()
         if not word:
@@ -341,6 +377,7 @@ def run_tesseract_text(
         low = conf < confidence_threshold
         key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
         lines.setdefault(key, []).append((y, x, word, w, h, low))
+        word_conf[(key, x, y)] = float(conf)
 
     line_items = []  # (y, key, [(x, word), ...]) — порядок строк на странице
     for key, words in lines.items():
@@ -348,6 +385,11 @@ def run_tesseract_text(
         y = min(w[0] for w in words)
         line_items.append((y, key, words))
     line_items.sort(key=lambda item: item[0])
+
+    rich_lines: list[tuple[str, ...]] | None = None
+    formulas: list[vlm_text.Formula] = []
+    if clean_marks_fn is not None or reread_text_fn is not None:
+        line_items, rich_lines, formulas = _apply_word_fns(line_items, word_conf, clean_marks_fn, reread_text_fn)
 
     if detect_marks_fn is not None:
         line_items = _apply_mark_escalation(
@@ -365,12 +407,13 @@ def run_tesseract_text(
         low and new == old for low, old, new in zip(flat_low, flat_words, restored_words)
     ]
 
-    blocks: list[TextBlock] = []
+    blocks: list[TextBlock | FormulaBlock] = []
     pos = 0
-    for y, _key, words in line_items:
+    for i, (y, _key, words) in enumerate(line_items):
         restored = restored_words[pos : pos + len(words)]
         low_flags = tuple(flat_low[pos : pos + len(words)])
         pos += len(words)
+        rich = rich_lines[i] if rich_lines is not None and any(rich_lines[i]) else ()
         blocks.append(
             TextBlock(
                 y=y,
@@ -379,9 +422,50 @@ def run_tesseract_text(
                 x1=max(w[1] + w[3] for w in words),
                 height=max(w[4] for w in words),
                 low_words=low_flags,
+                rich_words=rich,
             )
         )
+    blocks.extend(FormulaBlock(y=f.box[1], latex=f.latex, bbox=f.box) for f in formulas)
+    blocks.sort(key=lambda b: b.y)
     return blocks
+
+
+def _apply_word_fns(
+    line_items: list[tuple[float, tuple[int, int, int], list["_WordTuple"]]],
+    word_conf: dict[tuple[tuple[int, int, int], float, float], float],
+    clean_marks_fn: Callable[[list[list[vlm_marks.Word]]], list[list[vlm_marks.Word]]] | None,
+    reread_text_fn: Callable[[list[list[vlm_marks.Word]]],
+                             tuple[list[list[vlm_marks.Word]], list[vlm_text.Formula]]] | None,
+) -> tuple[list[tuple[float, tuple[int, int, int], list["_WordTuple"]]], list[tuple[str, ...]],
+           list[vlm_text.Formula]]:
+    """Строки Tesseract → слова vlm_marks → чистка меток → второе прочтение → обратно в строки
+    (и разметка слов, и формулы-блоки). Порядок строк сохраняется; заменённое или дописанное
+    слово — неуверенное."""
+    word_lines = [
+        [
+            vlm_marks.Word(word, word_conf.get((key, x, y), 0.0), (x, y, x + w, y + h))
+            for (y, x, word, w, h, _low) in words
+        ]
+        for _y, key, words in line_items
+    ]
+    lows = {(wd.box, wd.text): low for (_y, _key, words), wl in zip(line_items, word_lines)
+            for wd, (*_, low) in zip(wl, words)}
+    if clean_marks_fn is not None:
+        word_lines = clean_marks_fn(word_lines)
+    formulas: list[vlm_text.Formula] = []
+    if reread_text_fn is not None:
+        word_lines, formulas = reread_text_fn(word_lines)
+    result = []
+    rich = []
+    for i, wl in enumerate(word_lines):
+        words = [
+            (wd.box[1], wd.box[0], wd.text, wd.box[2] - wd.box[0], wd.box[3] - wd.box[1],
+             wd.restored or lows.get((wd.box, wd.text), False))
+            for wd in wl
+        ]
+        result.append((min(w[0] for w in words), (-1, i, 0), words))
+        rich.append(tuple(wd.rich for wd in wl))
+    return result, rich, formulas
 
 
 _ESCALATION_CROP_PADDING = 25  # пикселей при 200 DPI — запас вокруг области метки при вырезании для ИИ-эскалации
@@ -1215,10 +1299,15 @@ def ocr_page(
     table_blocks_fn: Callable[[Path], list[TableBlock]] | None = None,
     detect_marks_fn: Callable[[Path, list[Box]], list[mark_detection.Mark]] | None = None,
     recover_covered_text_fn: Callable[[Path], str] | None = None,
+    clean_marks_fn: Callable[[list[list[vlm_marks.Word]]], list[list[vlm_marks.Word]]] | None = None,
+    reread_text_fn: Callable[[list[list[vlm_marks.Word]]],
+                             tuple[list[list[vlm_marks.Word]], list[vlm_text.Formula]]] | None = None,
 ) -> list[PageBlock]:
     """Таблицы и обычный текст страницы, слитые в порядке чтения (сверху вниз).
     Таблицы — через table_blocks_fn (TATR) или predict_tables_fn (прежний путь PaddleOCR).
-    detect_marks_fn/recover_covered_text_fn — см. run_tesseract_text."""
+    detect_marks_fn/recover_covered_text_fn/clean_marks_fn/reread_text_fn — см. run_tesseract_text;
+    таблицы распознаются раньше текста, так что clean_marks_fn и reread_text_fn могут взять ответ
+    DeepSeek на страницу."""
     if table_blocks_fn is not None:
         tables = table_blocks_fn(image_path)
     else:
@@ -1231,6 +1320,8 @@ def ocr_page(
         authority_name=authority_name,
         detect_marks_fn=detect_marks_fn,
         recover_covered_text_fn=recover_covered_text_fn,
+        clean_marks_fn=clean_marks_fn,
+        reread_text_fn=reread_text_fn,
     )
     blocks: list[PageBlock] = [*tables, *text_blocks]
     blocks.sort(key=lambda b: b.y)
@@ -1294,27 +1385,31 @@ _CENTER_MAX_WIDTH_RATIO = 0.95
 _PARAGRAPH_GAP_RATIO = 1.5  # зазор больше этой доли высоты строки — новый абзац
 
 
-def _block_segments(b: TextBlock) -> list[tuple[str, bool]]:
+Segment = tuple[str, bool, str]  # слово или пробел, низкая уверенность, разметка (TextBlock.rich_words)
+
+
+def _block_segments(b: TextBlock) -> list[Segment]:
     words = b.text.split(" ")
     flags = b.low_words if len(b.low_words) == len(words) else (False,) * len(words)
-    segments: list[tuple[str, bool]] = []
-    for i, (word, low) in enumerate(zip(words, flags)):
+    rich = b.rich_words if len(b.rich_words) == len(words) else ("",) * len(words)
+    segments: list[Segment] = []
+    for i, (word, low, markup) in enumerate(zip(words, flags, rich)):
         if i:
-            segments.append((" ", False))
-        segments.append((word, low))
+            segments.append((" ", False, ""))
+        segments.append((word, low, markup))
     return segments
 
 
-def _paragraph_segments(group: list[TextBlock]) -> list[tuple[str, bool]]:
-    segments: list[tuple[str, bool]] = []
+def _paragraph_segments(group: list[TextBlock]) -> list[Segment]:
+    segments: list[Segment] = []
     for i, b in enumerate(group):
         if i:
-            segments.append((" ", False))
+            segments.append((" ", False, ""))
         segments.extend(_block_segments(b))
     return segments
 
 
-def _text_paragraphs(run: list[TextBlock], dpi: int) -> list[tuple[str, str, float, list[tuple[str, bool]]]]:
+def _text_paragraphs(run: list[TextBlock], dpi: int) -> list[tuple[str, str, float, list[Segment]]]:
     """Склеивает строки одного непрерывного текстового участка в абзацы по геометрии.
     Возвращает (текст, выравнивание 'left'|'center', отступ первой строки в пт, сегменты
     с флагами низкой уверенности). Жирный/курсив/сноски по Tesseract не определяются."""
@@ -1363,7 +1458,7 @@ def _text_paragraphs(run: list[TextBlock], dpi: int) -> list[tuple[str, str, flo
             paragraphs[-1].append(b)
         prev = b
 
-    result: list[tuple[str, str, float, list[tuple[str, bool]]]] = []
+    result: list[tuple[str, str, float, list[Segment]]] = []
     for group in paragraphs:
         first = group[0]
         text = " ".join(b.text for b in group)
@@ -1523,7 +1618,10 @@ def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DP
         def flush_run() -> None:
             for _text, align, first_line, segments in _text_paragraphs(run, dpi):
                 para = doc.add_paragraph()
-                for segment, low in segments:
+                for segment, low, markup in segments:
+                    if markup:
+                        docx_math.add_rich(para, markup, low)
+                        continue
                     word_run = para.add_run(segment)
                     if low:
                         word_run.font.highlight_color = WD_COLOR_INDEX.YELLOW
@@ -1536,6 +1634,9 @@ def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DP
         for block in page.blocks:
             if isinstance(block, TextBlock):
                 run.append(block)
+            elif isinstance(block, FormulaBlock):
+                flush_run()
+                docx_math.add_formula(doc, block.latex)
             else:
                 flush_run()
                 _add_table(doc, block)
@@ -1775,6 +1876,8 @@ def _block_to_dict(block: PageBlock) -> dict:
             "dropped_columns": block.dropped_columns,
             "cells": [{**asdict(c), "low_lines": list(c.low_lines)} for c in block.cells],
         }
+    if isinstance(block, FormulaBlock):
+        return {"type": "formula", "y": block.y, "latex": block.latex, "bbox": list(block.bbox)}
     return {
         "type": "text",
         "y": block.y,
@@ -1783,6 +1886,7 @@ def _block_to_dict(block: PageBlock) -> dict:
         "x1": block.x1,
         "height": block.height,
         "low_words": list(block.low_words),
+        "rich_words": list(block.rich_words),
     }
 
 
@@ -1796,6 +1900,8 @@ def _block_from_dict(data: dict) -> PageBlock:
             n_cols=data["n_cols"],
             dropped_columns=data["dropped_columns"],
         )
+    if data["type"] == "formula":
+        return FormulaBlock(y=data["y"], latex=data["latex"], bbox=tuple(data["bbox"]))
     return TextBlock(
         y=data["y"],
         text=data["text"],
@@ -1803,6 +1909,7 @@ def _block_from_dict(data: dict) -> PageBlock:
         x1=data["x1"],
         height=data["height"],
         low_words=tuple(data["low_words"]),
+        rich_words=tuple(data.get("rich_words", ())),
     )
 
 
@@ -1934,6 +2041,7 @@ def ocr_document(
     orientation_fn: Callable[[Path], int] | None = None,
     vlm_chat_fn: Callable[[Image.Image], str] | None = None,
     vlm_ask_fn: "vlm_reread.AskFn | None" = None,
+    marks_ask_fn: Callable[[Image.Image], str] | None = None,
 ) -> OcrDocumentResult:
     """Точка входа этапа 3. Постранично: если у страницы уже есть текстовый слой
     (>= min_page_text_chars символов) — используется он как есть, OCR не
@@ -1954,7 +2062,11 @@ def ocr_document(
     table_engine="vlm" — таблицы через DeepSeek-OCR в vLLM на GPU (vlm_tables.py,
     vlm_chat_fn — инъекция модели); сомнительные ячейки дочитываются по кропу (vlm_reread.py,
     vlm_ask_fn — инъекция модели). Если vLLM не ответил — до конца документа TATR. Таблицы,
-    продолжающиеся на следующей странице, при этом сшиваются в одну (stitch_tables).
+    продолжающиеся на следующей странице, при этом сшиваются в одну (stitch_tables). Вместе с
+    use_ai_escalation вместо прежней эскалации — чистка меток (vlm_marks.py): qwen3-vl в Ollama
+    находит штампы, печати, подписи (marks_ask_fn — инъекция модели; зовётся не на всех
+    страницах, см. vlm_marks.should_locate), их текст выкидывается, текст документа у меток
+    сверяется с ответом DeepSeek на страницу. Ollama недоступна — до конца документа без чистки.
 
     predict_tables_fn/image_data_fn — инъекция движков; по умолчанию настоящие
     тяжёлые модели (см. _default_predict_tables_fn/_default_image_data_fn), в
@@ -1996,8 +2108,12 @@ def ocr_document(
             "pdf_size": pdf_path.stat().st_size,
         }
         if table_engine == "vlm":
-            # версия пути vlm: 2 — с дочиткой ячеек; страницы прежних прогонов пересчитываются
-            meta["vlm_version"] = 2
+            # версия пути vlm: 2 — с дочиткой ячеек, 3 — со вторым прочтением текста (vlm_text);
+            # страницы прежних прогонов пересчитываются
+            meta["vlm_version"] = 3
+            if use_ai_escalation:
+                # чистка меток по трём прочтениям (vlm_marks) вместо прежней ИИ-эскалации
+                meta["marks_version"] = 1
         if orientation_fn is None:
             orientation_fn = _default_orientation_fn
         reader = pypdf.PdfReader(str(pdf_path))
@@ -2012,6 +2128,9 @@ def ocr_document(
     tatr_fallback_pages: set[int] = set()  # table_engine="vlm": таблицы страницы ушли в TATR
     vlm_chat_fn = vlm_chat_fn or vlm_tables.deepseek_chat
     vlm_ask_fn = vlm_ask_fn or vlm_reread.deepseek_ask
+    marks_ask_fn = marks_ask_fn or vlm_marks.qwen_locate
+    marks_down: str | None = None  # чистка меток: причина, по которой Ollama недоступна
+    page_ds: dict[int, str] = {}  # ответ DeepSeek на страницу — для чистки меток
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i, (pdf_page, fitz_page) in enumerate(zip(reader.pages, fitz_doc)):
             page_number = i + 1
@@ -2094,7 +2213,11 @@ def ocr_document(
                 nonlocal vlm_down
                 if vlm_down is None:
                     try:
-                        return run_vlm_table_blocks(path, vlm_chat_fn, ask_fn=vlm_ask_fn, timer=timer, page=_page)
+                        def chat(img: Image.Image) -> str:
+                            page_ds[_page] = vlm_chat_fn(img)  # тот же ответ — опора для чистки меток
+                            return page_ds[_page]
+
+                        return run_vlm_table_blocks(path, chat, ask_fn=vlm_ask_fn, timer=timer, page=_page)
                     except vlm_tables.VlmUnavailable as exc:
                         vlm_down = str(exc)
                         print(f"{exc} — таблицы через TATR до конца документа", file=sys.stderr, flush=True)
@@ -2102,6 +2225,42 @@ def ocr_document(
                 tatr_fallback_pages.add(_page)
                 return tatr_tables_fn(path)
 
+            def clean_marks_fn(lines: list[list[vlm_marks.Word]], _page: int = page_number,
+                               path: Path = image_path) -> list[list[vlm_marks.Word]]:
+                # Ollama не ответила — до конца документа без чистки (как запасной путь таблиц)
+                nonlocal marks_down
+                if marks_down is not None:
+                    return lines
+                with Image.open(path) as img:
+                    img.load()
+                low_boxes = [w.box for line in lines for w in line if w.conf < confidence_threshold]
+                clusters = mark_detection.cluster_candidate_regions(low_boxes)
+                ds_raw = page_ds.get(_page)
+                if not vlm_marks.should_locate(_page, total, ds_raw, img.width, img.height, len(clusters)):
+                    return lines
+                t0 = time.perf_counter()
+                try:
+                    marks = vlm_marks.locate_marks(img, ask=marks_ask_fn)
+                except vlm_marks.MarksUnavailable as exc:
+                    marks_down = str(exc)
+                    print(f"{exc} — без чистки меток до конца документа", file=sys.stderr, flush=True)
+                    timer.add(_page, f"метки: Ollama недоступна ({exc})", 0.0)
+                    return lines
+                finally:
+                    timer.add(_page, "метки: qwen3-vl (Ollama)", time.perf_counter() - t0)
+                print(f"  [стр. {_page}] метки: " + (", ".join(m.label for m in marks) or "нет"),
+                      file=sys.stderr, flush=True)
+                return vlm_marks.clean_lines(lines, marks, ds_raw, img.width, img.height, authority_name)
+
+            def reread_text_fn(lines: list[list[vlm_marks.Word]], _page: int = page_number,
+                               path: Path = image_path) -> tuple[list[list[vlm_marks.Word]], list[vlm_text.Formula]]:
+                # ответ DeepSeek на страницу — тот же, что для таблиц (нет его — запасной путь TATR)
+                with Image.open(path) as img:
+                    width, height = img.size
+                with timer.step(_page, "текст: второе прочтение DeepSeek"):
+                    return vlm_text.reread_lines(lines, page_ds.get(_page), width, height)
+
+            use_marks = use_vlm and use_ai_escalation
             if use_tatr or use_vlm:
                 blocks = ocr_page(
                     image_path,
@@ -2109,8 +2268,11 @@ def ocr_document(
                     image_data_fn=timed_image_data,
                     confidence_threshold=confidence_threshold,
                     authority_name=authority_name,
-                    detect_marks_fn=_default_detect_marks_fn if use_ai_escalation else None,
-                    recover_covered_text_fn=ai_escalation.recover_covered_text if use_ai_escalation else None,
+                    detect_marks_fn=_default_detect_marks_fn if use_ai_escalation and not use_marks else None,
+                    recover_covered_text_fn=(
+                        ai_escalation.recover_covered_text if use_ai_escalation and not use_marks else None),
+                    clean_marks_fn=clean_marks_fn if use_marks else None,
+                    reread_text_fn=reread_text_fn if use_vlm else None,
                 )
             else:
                 blocks = ocr_page(
@@ -2129,7 +2291,7 @@ def ocr_document(
                 page_height=page_height,
             )
             # страница с таблицами из запасного TATR — с другой meta: следующий прогон того же PDF
-            # (сервис кладёт страницы по имени файла) не возьмёт её, а распознает через vLLM заново
+            # (повторный запуск CLI с тем же --out) не возьмёт её, а распознает через vLLM заново
             page_meta = {**meta, "tables": "tatr"} if page_number in tatr_fallback_pages else meta
             with timer.step(page_number, "сохранение страницы"):
                 _save_page(page_file, page, page_meta)

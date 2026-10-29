@@ -1,0 +1,6 @@
+```json
+[
+	{"label": "stamp", "bbox_2d": [657, 35, 997, 185]},
+	{"label": "signature", "bbox_2d": [457, 937, 785, 962]}
+]
+```
