@@ -1,15 +1,12 @@
-"""HTTP API поверх CLI npa-ocr — асинхронные задания распознавания для внешних
-потребителей (см. README, «HTTP API»).
+"""HTTP API асинхронного распознавания (см. README, «HTTP API»).
 
-Не знает ни о каком конкретном потребителе — принимает PDF файлом, отдаёт
-DOCX файлом; реквизиты/разметка документа не его забота. Один и тот же образ Docker служит и CLI (ENTRYPOINT ["npa-ocr"]
-по умолчанию), и этим сервером — см. README, «Docker», раздел про запуск
-сервера отдельной командой.
+Сервер принимает PDF файлом и отдаёт DOCX файлом; о потребителях и реквизитах
+документов он не знает. Тот же образ Docker по умолчанию запускает CLI, сервер
+запускается отдельной командой (см. README, «Docker»).
 
-Задания — JobManager (job_runner.py) запускает CLI как подпроцесс (self-exec):
-падение/OOM в подпроцессе не роняет сам сервер, см. докстринг job_runner.py.
-Одновременно выполняется не больше одного задания — POST /jobs отвечает 409,
-пока предыдущее ещё running.
+Задания выполняет :class:`~npa_ocr.job_runner.JobManager`: CLI запускается
+подпроцессом, поэтому падение или нехватка памяти в задании не роняют сервер.
+Одновременно выполняется одно задание; пока оно идёт, ``POST /jobs`` отвечает 409.
 """
 
 from __future__ import annotations
@@ -31,6 +28,7 @@ _manager = JobManager(JOBS_DIR)
 
 
 def _job_or_404(job_id: str) -> Job:
+    """Задание по идентификатору; HTTPException 404, если его нет."""
     job = _manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Задание не найдено")
@@ -39,6 +37,7 @@ def _job_or_404(job_id: str) -> Job:
 
 @app.get("/health")
 def health() -> dict:
+    """Проверка готовности сервера."""
     return {"ok": True}
 
 
@@ -47,18 +46,26 @@ async def create_job(
     file: UploadFile = File(...),
     authority_name: str | None = Form(default=None),
 ) -> dict:
-    """Загружает PDF и запускает распознавание. Возвращает job_id сразу, не
-    дожидаясь завершения — прогресс см. GET /jobs/{job_id}.
+    """Загружает PDF и запускает распознавание.
+
+    Ответ приходит сразу, не дожидаясь конца распознавания; ход задания
+    отдаёт ``GET /jobs/{job_id}``.
+
+    Args:
+        file: PDF документа.
+        authority_name: Наименование органа, издавшего акт; по нему
+            восстанавливается шапка документа.
+
+    Returns:
+        ``{"job_id": ...}``.
 
     Raises:
-        HTTPException 409: уже выполняется другое задание (см. JobManager —
-            одновременно разрешено только одно, тяжёлые модели в памяти).
+        HTTPException: 409, если уже выполняется другое задание.
     """
     data = await file.read()
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-    # Имя — случайное, не оригинальное из запроса: job_runner.JobManager строит
-    # пути файлов задания из stem этого пути, он должен быть уникален между
-    # заданиями (оригинальные имена могли бы совпасть у разных запросов).
+    # Имя случайное, а не из запроса: JobManager строит пути файлов задания из
+    # stem этого пути, и он должен быть уникален между заданиями.
     upload_path = UPLOADS_DIR / f"{uuid.uuid4().hex}.pdf"
     upload_path.write_bytes(data)
     try:
@@ -70,11 +77,13 @@ async def create_job(
 
 @app.get("/jobs/{job_id}")
 def job_status(job_id: str) -> dict:
+    """Состояние задания: статус, ход распознавания, ошибка."""
     return _job_or_404(job_id).to_dict()
 
 
 @app.get("/jobs/{job_id}/result")
 def job_result(job_id: str) -> FileResponse:
+    """DOCX готового задания; 404, пока распознавание не завершено."""
     job = _job_or_404(job_id)
     if job.status != "done" or not job.docx_path.is_file():
         raise HTTPException(status_code=404, detail="Распознавание ещё не завершено")
@@ -87,6 +96,7 @@ def job_result(job_id: str) -> FileResponse:
 
 @app.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: str) -> dict:
+    """Отменяет задание и возвращает его состояние."""
     job = _job_or_404(job_id)
     _manager.cancel(job)
     return job.to_dict()

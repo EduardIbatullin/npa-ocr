@@ -1,30 +1,37 @@
-"""Второе прочтение текста страницы ответом DeepSeek-OCR: римские цифры, латинские переменные,
-индексы и степени, формулы. Tesseract с русским словарём их не знает и пишет похожими русскими
-буквами: «II» → «П», «IV» → «ГУ», «Z» → «7», «V» → «У», «i-м» → «1-м», «16³» → «163»,
-«K<sub>пр</sub>» → «Кир», формула «Z = S/V × 100%» → «7-5. х100%, у». DeepSeek-OCR (ответ на
-страницу, уже полученный для таблиц) читает их верно: римские — латиницей, индексы — <sub>/<sup>,
-формулы — LaTeX (блок equation, в тексте — \\(…\\)). Сверка по 179 страницам 14 документов —
-npa-vlm-ocr formulas/: 79 римских, 24 индекса/степени, 12 формул; у Tesseract верных — ни одного.
+"""Второе прочтение текста страницы по ответу DeepSeek-OCR.
 
-Русский текст при этом остаётся за Tesseract: DeepSeek иногда сам портит русские слова
-транслитом («окружающей» → «okpyxakouIeI»). Правила (`reread_lines`):
-- слово DeepSeek заменяет слова Tesseract только внутри короткого расхождения, у которого с
-  одной из сторон совпавшее слово (выравнивание по difflib на словах строк в рамке блока);
-- блок DeepSeek с транслитом (латинское слово из 4+ букв на месте русского) не используется;
-- римская цифра — только если слово Tesseract похоже на неё по начертанию («П» → II, «Ш» → III,
-  «ГУ» → IV, «У» → V, «[», «|», «Г», «1» → I): «I. МОСКВА» у DeepSeek на месте «г.» не проходит;
-- латинская буква-переменная — 1–3 буквы (с «-м», «-го» и т. п.), и не двойник русской буквы
-  Tesseract (K/К, B/В, C/С — в русском тексте вернее Tesseract), не её транслит («b» на месте «б»)
-  и не маркер пункта списка в начале блока («b)» — в актах пункты «а)», «б)»);
-- индекс, степень, \\(формула\\) в тексте — разметкой DeepSeek (`Word.rich`, в DOCX — подстрочный
-  и надстрочный шрифт, формула Word); индексы, записанные без разметки, переводятся в неё:
-  символы Юникода «Sᵢᵏ», подчёркивание «C_t», латинская заглавная, слитая с русским индексом
-  «Mфиатм» (последнее — только поверх неуверенного слова Tesseract и не двойником буквы);
-- цифра, прочитанная Tesseract буквой или слитая со словом: «Злет» → «3 лет», «2013г.» →
-  «2013 г.», «пункта3» → «пункта 3» — если у Tesseract то же после замены букв-двойников цифр, а
-  DeepSeek делит только на стыке цифры и буквы или «№» («1316-р» не делится);
-- блок equation заменяет строки Tesseract в своей рамке — формула Word (`Formula`).
-Заменённое — жёлтое, как и прочие правки по второму прочтению."""
+Tesseract с русским словарём не знает римских цифр, латинских переменных,
+индексов и формул и пишет их похожими русскими буквами: «II» → «П»,
+«IV» → «ГУ», «Z» → «7», «V» → «У», «16³» → «163», «K<sub>пр</sub>» → «Кир».
+DeepSeek-OCR читает их верно: римские цифры — латиницей, индексы — разметкой
+``<sub>``/``<sup>``, формулы — LaTeX (блок ``equation``, в тексте —
+``\\(…\\)``). Русский текст при этом остаётся за Tesseract: DeepSeek иногда
+пишет русские слова транслитом.
+
+Правила :func:`reread_lines`:
+
+- Слова DeepSeek заменяют слова Tesseract только в коротком расхождении,
+  соседнем с совпавшим словом (выравнивание difflib по словам строк в рамке
+  блока).
+- Блок DeepSeek с транслитом (латинское слово из 4+ букв) не используется.
+- Римская цифра принимается, только если слово Tesseract похоже на неё по
+  начертанию («П» → II, «ГУ» → IV, «[» → I); диапазон «I–V» — если слово
+  Tesseract состоит только из таких знаков.
+- Латинская переменная (1–3 буквы, возможно с окончанием «-м», «-го»)
+  принимается, если она не двойник русской буквы Tesseract (K/К, C/С), не её
+  транслит («b» на месте «б») и не маркер пункта списка в начале блока.
+- Индексы, степени и формулы в тексте хранятся разметкой (``Word.rich``); в
+  разметку переводятся и индексы, записанные без неё: символы Юникода «Sᵢᵏ»,
+  подчёркивание «C_t», заглавная латинская буква, слитая с русским индексом
+  «Mфиатм» (только поверх неуверенного слова Tesseract).
+- Цифра, прочитанная буквой или слитая со словом («Злет» → «3 лет»,
+  «2013г.» → «2013 г.»), исправляется, если после замены букв-двойников цифр
+  текст совпадает, а DeepSeek делит его только на стыке цифры и буквы или «№».
+- Блок ``equation`` заменяет строки Tesseract в своей рамке формулой
+  (:class:`Formula`).
+
+Заменённые слова помечаются как восстановленные и выделяются в DOCX жёлтым.
+"""
 
 from __future__ import annotations
 
@@ -35,11 +42,11 @@ from dataclasses import dataclass
 from npa_ocr.vlm_marks import Box, Word, ds_blocks
 
 # Слово DeepSeek: \(LaTeX\) или слово с <sub>/<sup> целиком (внутри бывают пробелы:
-# «P<sub>сд атм</sub>», «\(P_{\text{сд атм}}\)»), иначе — до пробела.
+# «P<sub>сд атм</sub>»), иначе — до пробела.
 _TOKEN_RE = re.compile(r"\S*?\\\(.*?\\\)\S*|\S*?<su[bp]>.*?</su[bp]>(?:\S*?<su[bp]>.*?</su[bp]>)*\S*|\S+")
 _TAG_RE = re.compile(r"</?su[bp]>")
 _ROMAN_RE = re.compile(r"^[IVXLC]{1,6}$")
-# диапазон классов опасности «I–V», «I-II» (228 стр. 3, 9, 12)
+# диапазон: «I–V», «I-II»
 _ROMAN_RANGE_RE = re.compile(r"^[IVXLC]{1,4}[-–—][IVXLC]{1,4}$")
 _LATIN_VAR_RE = re.compile(r"^[A-Za-z]{1,3}(-[а-яё]{1,3})?$")
 _LIST_MARKER_RE = re.compile(r"^[a-z]\)$")
@@ -47,8 +54,8 @@ _SUP_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 _SUBSUP_CHARS = "¹²³⁴⁵⁶⁷⁸⁹⁰₀₁₂₃₄₅₆₇₈₉"
 # латинские буквы, неотличимые от русских на скане: на них в русском тексте вернее Tesseract
 _HOMOGLYPHS = set("ABCEHKMOPTXaceopxy")
-# русская буква у Tesseract, транслитом которой DeepSeek пишет латинскую: «б)» → «b)» в списке
-# (156 стр. 8), «и» → «i». «У» на месте V и «7» на месте Z — не транслит, там прав DeepSeek
+# русская буква Tesseract, которую DeepSeek пишет латинским транслитом: «б)» → «b)», «и» → «i».
+# «У» на месте V и «7» на месте Z — не транслит, там прав DeepSeek
 _TRANSLIT = {"a": "а", "b": "б", "v": "в", "g": "г", "d": "д", "e": "е", "z": "з", "i": "и", "k": "к",
              "l": "л", "m": "м", "n": "н", "o": "о", "p": "п", "r": "р", "s": "с", "t": "т", "u": "у",
              "f": "ф", "h": "х", "c": "ц"}
@@ -58,13 +65,13 @@ _ROMAN_LOOKALIKE = str.maketrans({"П": "II", "Ш": "III", "У": "V", "Г": "I",
 # диапазон Tesseract пишет слитно и с потерей знаков: «I–IV» → «ГУ», «I–II» → «ЕП», «Г», «[-П», «1-П»
 _ROMAN_RANGE_LOOKALIKE = "ПШУГТ[]|1l!НХЕ-–—"
 _PUNCT = ".,;:()«»\"'’"
-# индексы, которые DeepSeek пишет символами Юникода («Sᵢᵏ», 710 стр. 12) — в разметку <sub>/<sup>
+# индексы, записанные символами Юникода («Sᵢᵏ»), — в разметку <sub>/<sup>
 _UNI_SUB = dict(zip("ᵢⱼₐₑₒₓₕₖₗₘₙₚₛₜᵣᵤᵥ₀₁₂₃₄₅₆₇₈₉", "ijaeoxhklmnpstruv0123456789"))
 _UNI_SUP = dict(zip("ⁱʲᵏᵐⁿᵗˡʰᵃᵇᶜᵈᵉᶠᵍᵒᵖʳˢᵘᵛʷˣʸᶻ", "ijkmntlhabcdefgoprsuvwxyz"))
-_UNDERSCORE_RE = re.compile(r"^(\(?)([A-Za-z]{1,3})_([0-9A-Za-zА-Яа-яЁё]+)([.,;:)]*)$")  # «C_t» (710 стр. 13)
-# латинская заглавная, слитая с русским индексом: «Mфиатм» (710 стр. 10, на скане M с индексом «фi атм»)
+_UNDERSCORE_RE = re.compile(r"^(\(?)([A-Za-z]{1,3})_([0-9A-Za-zА-Яа-яЁё]+)([.,;:)]*)$")  # «C_t»
+# латинская заглавная, слитая с русским индексом: «Mфиатм» (M с индексом «фиатм»)
 _GLUED_RE = re.compile(r"^(\(?)([A-Z])([а-яё]{2,})([.,;:)]*)$")
-# цифры, которые Tesseract читает буквами: «Злет» на месте «3 лет» (710 стр. 3)
+# цифры, которые Tesseract читает буквами: «Злет» на месте «3 лет»
 _DIGIT_LOOKALIKE = str.maketrans({"З": "3", "з": "3", "О": "0", "о": "0", "б": "6", "l": "1", "I": "1", "|": "1"})
 _CYR_TWIN = str.maketrans("ABCEHKMOPTXaceopxy", "АВСЕНКМОРТХасеорху")
 MAX_SPAN = 4  # длина расхождения (слов), в котором DeepSeek может заменить слова Tesseract
@@ -73,13 +80,18 @@ FORMULA_MARGIN = 10  # пикселей: строки Tesseract у рамки ф
 
 @dataclass(frozen=True)
 class Formula:
+    """Формула-блок страницы: LaTeX и рамка в пикселях."""
+
     latex: str  # без \[ \]
     box: Box
 
 
 def plain(token: str) -> str:
-    """Разметка DeepSeek → простой текст (для text блока: колонтитулы, поиск): «K<sub>пр</sub>» →
-    «Kпр», «16<sup>3</sup>» → «16³», «\\(V_i\\)» → «V_i»."""
+    """Переводит разметку DeepSeek в простой текст.
+
+    Например: «K<sub>пр</sub>» → «Kпр», «16<sup>3</sup>» → «16³»,
+    ``\\(V_i\\)`` → «V_i».
+    """
     token = re.sub(r"<sup>(\d+)</sup>", lambda m: m.group(1).translate(_SUP_DIGITS), token)
     token = _TAG_RE.sub("", token)
     token = re.sub(r"\\\((.*?)\\\)", r"\1", token)
@@ -88,16 +100,20 @@ def plain(token: str) -> str:
 
 
 def _norm(token: str) -> str:
+    """Простой текст слова без знаков препинания по краям, в нижнем регистре."""
     return plain(token).strip(_PUNCT).lower()
 
 
 def _core(token: str) -> str:
+    """Простой текст слова без знаков препинания по краям."""
     return plain(token).strip(_PUNCT)
 
 
 def _markup(token: str) -> str:
-    """Индексы, записанные DeepSeek без разметки, — в <sub>/<sup>: «Sᵢᵏ» → «S<sub>i</sub><sup>k</sup>»,
-    «C_t» → «C<sub>t</sub>»."""
+    """Переводит индексы, записанные без разметки, в ``<sub>``/``<sup>``.
+
+    Например: «Sᵢᵏ» → «S<sub>i</sub><sup>k</sup>», «C_t» → «C<sub>t</sub>».
+    """
     if any(c in _UNI_SUB or c in _UNI_SUP for c in token):
         out, mode = [], ""
         for c in token:
@@ -116,6 +132,12 @@ def _markup(token: str) -> str:
 
 
 def _kind(token: str) -> str | None:
+    """Вид слова DeepSeek, которому можно доверять больше, чем Tesseract.
+
+    Returns:
+        ``"latex"``, ``"index"``, ``"glued"``, ``"roman"``, ``"roman_range"``,
+        ``"latin"`` или None для обычного слова.
+    """
     if "\\(" in token:
         return "latex"
     if "<sub>" in token or "<sup>" in token or any(c in token for c in _SUBSUP_CHARS):
@@ -133,9 +155,12 @@ def _kind(token: str) -> str | None:
 
 
 def _digit_split(ds: list[str], tess: list[Word]) -> bool:
-    """«3 лет» у DeepSeek, «Злет» у Tesseract: то же самое, если у Tesseract буквы-двойники цифр
-    заменить цифрами; так же «2013г.» → «2013 г.», «пункта3» → «пункта 3». Меняется только цифра
-    или пробел на стыке цифры и буквы — русские слова те же («1316-р» не трогаем)."""
+    """Проверяет, что DeepSeek лишь отделил цифры от слов Tesseract.
+
+    «3 лет» у DeepSeek и «Злет» у Tesseract совпадают после замены
+    букв-двойников цифр; так же «2013г.» → «2013 г.». Разрешены только пробелы
+    на стыке цифры и буквы или рядом с «№» («1316-р» не делится).
+    """
     ds_joined = "".join(ds)
     if not any(c.isdigit() for c in ds_joined):
         return False
@@ -150,12 +175,20 @@ def _digit_split(ds: list[str], tess: list[Word]) -> bool:
 
 
 def _translit_block(tokens: list[str]) -> bool:
-    """Блок, где DeepSeek написал русские слова латиницей («oJJaCTH»): ему не верим."""
+    """Проверяет, что DeepSeek написал в блоке русские слова латиницей («oJJaCTH»)."""
     return any(len(re.sub(r"[^A-Za-z]", "", t)) >= 4 and not re.search(r"[А-Яа-яЁё\\<]", t) for t in tokens)
 
 
 def _accept(ds: list[str], tess: list[Word]) -> bool:
-    """Можно ли заменить слова Tesseract tess словами DeepSeek ds (одно расхождение)."""
+    """Решает, можно ли заменить слова Tesseract словами DeepSeek в одном расхождении.
+
+    Args:
+        ds: Слова DeepSeek.
+        tess: Слова Tesseract.
+
+    Returns:
+        True, если замена допустима по правилам модуля.
+    """
     if not ds or not tess or len(ds) > MAX_SPAN or len(tess) > MAX_SPAN:
         return False
     kinds = [_kind(t) for t in ds]
@@ -170,7 +203,7 @@ def _accept(ds: list[str], tess: list[Word]) -> bool:
     for t, k in zip(ds, kinds):
         core = _core(t)
         if k == "glued":
-            # «Mфиатм» поверх неуверенного «Мам», но не «Bыбросы» поверх «выбросы» (двойник буквы)
+            # только поверх неуверенного слова и не двойником буквы («Bыбросы» поверх «выбросы»)
             if min(w.conf for w in tess) >= 60 or core.translate(_CYR_TWIN).lower() == _norm(tess_joined):
                 return False
         elif k == "roman":
@@ -198,7 +231,7 @@ def _accept(ds: list[str], tess: list[Word]) -> bool:
 
 
 def _span_words(tess: list[Word], ds: list[str]) -> list[Word]:
-    """Слова DeepSeek на месте слов Tesseract: рамки — по рамкам заменённых слов."""
+    """Создаёт слова DeepSeek на месте слов Tesseract, деля их общую рамку поровну."""
     x0, y0 = tess[0].box[0], min(w.box[1] for w in tess)
     x1, y1 = tess[-1].box[2], max(w.box[3] for w in tess)
     step = (x1 - x0) / len(ds)
@@ -215,13 +248,27 @@ def _span_words(tess: list[Word], ds: list[str]) -> list[Word]:
 
 
 def tokens(text: str) -> list[str]:
-    """Слова блока DeepSeek; «##» заголовка Markdown — не слово («## II. Методы…», 228 стр. 4)."""
+    """Делит текст блока DeepSeek на слова.
+
+    Слово с разметкой берётся целиком, ``<br>`` считается пробелом, «##»
+    заголовка Markdown словом не считается.
+    """
     return [_markup(t) for t in _TOKEN_RE.findall(text.replace("<br>", " ")) if t.strip("#")]
 
 
 def reread_lines(lines: list[list[Word]], ds_raw: str | None, width: int, height: int
                  ) -> tuple[list[list[Word]], list[Formula]]:
-    """Строки Tesseract с правками по DeepSeek и формулы-блоки (строки на их месте выкинуты)."""
+    """Исправляет строки Tesseract по ответу DeepSeek-OCR на страницу.
+
+    Args:
+        lines: Строки слов Tesseract.
+        ds_raw: Ответ DeepSeek-OCR на страницу или None.
+        width: Ширина страницы, px.
+        height: Высота страницы, px.
+
+    Returns:
+        Исправленные строки (строки на месте формул удалены) и формулы-блоки.
+    """
     if not ds_raw:
         return lines, []
     blocks = ds_blocks(ds_raw, width, height)
@@ -233,6 +280,7 @@ def reread_lines(lines: list[list[Word]], ds_raw: str | None, width: int, height
                 formulas.append(Formula(latex, box))
 
     def in_formula(line: list[Word]) -> bool:
+        """Центр строки лежит в рамке формулы (с запасом)."""
         cx = sum((w.box[0] + w.box[2]) / 2 for w in line) / len(line)
         cy = sum((w.box[1] + w.box[3]) / 2 for w in line) / len(line)
         return any(f.box[0] - FORMULA_MARGIN <= cx <= f.box[2] + FORMULA_MARGIN
@@ -260,7 +308,7 @@ def reread_lines(lines: list[list[Word]], ds_raw: str | None, width: int, height
             if op != "replace":
                 continue
             anchored = (k > 0 and ops[k - 1][0] == "equal") or (k + 1 < len(ops) and ops[k + 1][0] == "equal")
-            # «b)» в начале блока — пункт списка «б)» (156 стр. 8): маркеры в актах кириллические
+            # «b)» в начале блока — пункт списка «б)»: маркеры в актах кириллические
             if a0 == 0 and _LIST_MARKER_RE.match(ds[0]):
                 continue
             span = refs[b0:b1]

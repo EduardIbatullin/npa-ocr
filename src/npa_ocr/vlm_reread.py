@@ -1,22 +1,27 @@
-"""Дочитка сомнительных ячеек таблицы DeepSeek-OCR по кропу ячейки. Перенесено из спайка
-npa-vlm-ocr (scripts/reread.py): на 14 документах — 156 ячеек, ~30 с на все.
+"""Повторное чтение сомнительных ячеек таблицы DeepSeek-OCR по фрагменту ячейки.
 
-Сомнительные ячейки отмечает сетка по линиям (vlm_tables.rebuild, GridResult.doubt):
-- kind="tess" — текст есть только от Tesseract («≤» он читает как «5», даты в повёрнутой ячейке —
-  мусор);
-- kind="empty" — в ячейке что-то напечатано, но текста нет;
-- kind="mismatch" — текст DeepSeek не похож на то, что видит Tesseract (228 стр. 25: вертикальную
-  шапку DeepSeek прочла плохо).
+Сомнительные ячейки отмечает :func:`npa_ocr.vlm_tables.rebuild`
+(``GridResult.doubt``):
 
-Попытки по порядку, следующая — только если ответ предыдущей отбракован (accept):
-  1. кроп ячейки, «Free OCR.»; вертикальный текст (is_vertical) — повёрнутым на ±90°, сторону
-     выбирает уверенность модели (средний logprob токенов);
-  2. ячейка рядом с соседней слева: одна «мг/нм³» читается латиницей или формулой, а рядом с
-     русским названием вещества — по-русски; известный текст соседа отрезается от ответа;
-  3. кроп ячейки, запрос на markdown.
-Для kind="mismatch" — только попытки 1–2, и текст DeepSeek заменяется лишь уверенным ответом
-(logprob ≥ CONFIDENT), заметно отличным от него и более близким к Tesseract. Знаки и единицы не
-угадываются — только чтение.
+- ``kind="tess"`` — текст есть только от Tesseract (например, «≤» он читает
+  как «5»);
+- ``kind="empty"`` — в ячейке что-то напечатано, но текста нет;
+- ``kind="mismatch"`` — текст DeepSeek не похож на прочитанное Tesseract.
+
+Попытки выполняются по порядку; следующая — только если ответ предыдущей
+отбракован (:func:`accept`):
+
+1. Фрагмент ячейки с запросом «Free OCR.». Вертикальный текст
+   (:func:`is_vertical`) читается повёрнутым на ±90°; сторону выбирает
+   уверенность модели (средний logprob токенов).
+2. Ячейка вместе с соседней слева: единицы вроде «мг/нм³» отдельно читаются
+   латиницей или формулой, а рядом с русским названием — по-русски. Известный
+   текст соседа отрезается от ответа.
+3. Фрагмент ячейки с запросом на markdown.
+
+Для ``kind="mismatch"`` выполняются только попытки 1–2, и текст DeepSeek
+заменяется лишь уверенным ответом (logprob ≥ ``CONFIDENT``), заметно отличным
+от него и более близким к Tesseract. Знаки и единицы не угадываются.
 """
 
 from __future__ import annotations
@@ -47,7 +52,19 @@ AskFn = Callable[[Image.Image, str], tuple[str, str, float]]
 
 
 def deepseek_ask(img: Image.Image, prompt: str) -> tuple[str, str, float]:
-    """Ответ DeepSeek-OCR на кроп, причина остановки и средний logprob токенов (уверенность)."""
+    """Запрашивает DeepSeek-OCR по фрагменту изображения.
+
+    Args:
+        img: Фрагмент.
+        prompt: Запрос.
+
+    Returns:
+        Текст ответа, причина остановки генерации и средний logprob токенов
+        (мера уверенности).
+
+    Raises:
+        VlmUnavailable: vLLM недоступен или ответ не разобран.
+    """
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     payload = {
@@ -78,10 +95,16 @@ _SUB = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
 
 
 def _sup(m: re.Match) -> str:
+    """Надстрочная цифра «²» или «³» для найденной «2» или «3»."""
     return "²³"[int(m[1]) - 2]
 
 
 def clean(text: str) -> str:
+    """Очищает ответ модели от разметки и LaTeX.
+
+    Убирает служебные токены и теги, переводит индексы в подстрочные цифры
+    («H_2SO_4» → «H₂SO₄»), степени — в надстрочные, ``\\le`` — в «≤».
+    """
     text = re.sub(r"<sup>\s*([23])\s*</sup>", _sup, text)
     text = re.sub(r"<\|[^|]*\|>", " ", text)
     text = re.sub(r"<[^>]+>", " ", text)          # обёртка таблицы/разметки, если модель её добавила
@@ -102,10 +125,23 @@ _TO_CYR = str.maketrans("ABCEHKMOPTXYaceopxyn", "АВСЕНКМОРТХУасе�
 
 
 def accept(text: str, d: dict, lp: float = -1.0) -> str | None:
-    """Ответ модели или None, если он негоден: формула вместо единиц («[HM+3].[Mg]», «\\text{MT}»),
-    латиница вместо русского текста; в ячейке без текста Tesseract (сверить не с чем; в повёрнутой
-    227 стр. 9 модель сочиняет русский текст) — число, «№», прочерк или текст, в котором модель
-    уверена (средний logprob ≥ CONFIDENT; у бессмыслицы в неверной ориентации −0.36…−0.9)."""
+    """Проверяет ответ модели для ячейки.
+
+    Отбраковываются формулы вместо единиц («[HM+3].[Mg]», ``\\text{MT}``),
+    греческие буквы и латиница на месте русского текста. Если у Tesseract в
+    ячейке текста нет и сверить не с чем, принимаются только число, «№»,
+    прочерк или ответ, в котором модель уверена (средний logprob ≥
+    ``CONFIDENT``): в неверной ориентации модель пишет бессмыслицу с низкой
+    уверенностью.
+
+    Args:
+        text: Очищенный ответ модели.
+        d: Описание ячейки; ``d["tess"]`` — текст Tesseract.
+        lp: Средний logprob ответа.
+
+    Returns:
+        Принятый текст (латинские двойники заменены кириллицей) или None.
+    """
     if not text or "\\" in text or "^" in text or re.search(r"\[[A-Za-z+0-9.-]+\]", text):
         return None
     if re.search(r"[Ͱ-Ͽ]", text):  # греческие буквы — модель читает кириллицу как формулу
@@ -122,7 +158,11 @@ def accept(text: str, d: dict, lp: float = -1.0) -> str | None:
 
 
 def strip_left(text: str, left: str) -> str:
-    """Отрезать от ответа начало, совпадающее с текстом соседа (модель читает обе ячейки подряд)."""
+    """Отрезает от ответа начало, совпадающее с текстом соседней ячейки.
+
+    Returns:
+        Остаток ответа или пустая строка, если начало не совпало с соседом.
+    """
     words, target = text.split(), norm(left)
     best, k_best = 0.0, 0
     for k in range(1, len(words)):
@@ -133,7 +173,11 @@ def strip_left(text: str, left: str) -> str:
 
 
 def _sim(a: str, b: str) -> float:
-    """Похожесть с учётом цифр: «предельные С1-С5» и «предельные C₆-C₁₀» — разные тексты."""
+    """Похожесть текстов с учётом цифр.
+
+    Тексты с разными цифрами («С1-С5» и «C₆-C₁₀») считаются непохожими, даже
+    если совпадают буквы.
+    """
     a, b = norm(a), norm(b)
     s = SequenceMatcher(None, a, b, autojunk=False).ratio()
     da, db = (re.sub(r"\D", "", x.translate(_SUB)) for x in (a, b))
@@ -143,8 +187,13 @@ def _sim(a: str, b: str) -> float:
 
 
 def _keep_ds(got: str | None, lp: float, d: dict) -> str | None:
-    """Текст DeepSeek (kind=mismatch) заменяем только уверенным ответом, который от него заметно
-    отличается и ближе к Tesseract; иначе расхождение — от Tesseract (он не читает индексы «C₆-C₁₀»)."""
+    """Решает, заменять ли текст DeepSeek ответом повторного чтения.
+
+    Для ``kind="mismatch"`` ответ принимается, только если он уверенный,
+    заметно отличается от текста DeepSeek и ближе к Tesseract; иначе
+    расхождение, скорее всего, на стороне Tesseract (например, он не читает
+    индексы «C₆-C₁₀»). Для остальных видов ответ возвращается без изменений.
+    """
     if d.get("kind") != "mismatch" or got is None:
         return got
     if lp < CONFIDENT or _sim(got, d["ds"]) >= 0.95 or _sim(got, d["tess"]) <= _sim(d["ds"], d["tess"]):
@@ -156,11 +205,22 @@ def _keep_ds(got: str | None, lp: float, d: dict) -> str | None:
 
 
 def _part(crop: Image.Image, box: list[int]) -> Image.Image:
+    """Фрагмент ячейки без линий рамки, в оттенках серого."""
     x0, y0, x1, y1 = box
     return crop.crop((x0 + PAD, y0 + PAD, x1 - PAD, y1 - PAD)).convert("L")
 
 
 def cell_image(crop: Image.Image, d: dict, rot: int = 0) -> Image.Image:
+    """Готовит изображение ячейки для модели.
+
+    Args:
+        crop: Фрагмент таблицы.
+        d: Описание ячейки с рамкой ``d["box"]``.
+        rot: Поворот, градусы.
+
+    Returns:
+        Повёрнутая и при необходимости увеличенная ячейка с белым полем.
+    """
     part = _part(crop, d["box"])
     if rot:
         part = part.rotate(rot, expand=True, fillcolor=255)
@@ -171,6 +231,7 @@ def cell_image(crop: Image.Image, d: dict, rot: int = 0) -> Image.Image:
 
 
 def pair_image(crop: Image.Image, d: dict) -> Image.Image:
+    """Изображение соседней слева ячейки и самой ячейки рядом, с белым полем."""
     a, b = _part(crop, d["left"]["box"]), _part(crop, d["box"])
     gap = 48
     img = Image.new("L", (a.width + gap + b.width, max(a.height, b.height)), 255)
@@ -180,16 +241,24 @@ def pair_image(crop: Image.Image, d: dict) -> Image.Image:
 
 
 def is_vertical(part: Image.Image, k: int = 15) -> bool:
-    """Строки текста идут сверху вниз. Ink растягиваем вдоль горизонтали и вдоль вертикали: строки
-    сливаются в полосы, и у вертикального текста вытянутость вертикальных полос в разы больше
-    (228 стр. 25: 5–16 против 0.7–2; у горизонтального — наоборот). Tesseract вертикальность
-    замечает не всегда («Код вида отходов…» он прочёл как «* о я Е Яо»)."""
+    """Проверяет, что текст в ячейке написан вертикально.
+
+    Изображение растягивается морфологическим расширением вдоль вертикали и
+    вдоль горизонтали, чтобы строки слились в полосы. У вертикального текста
+    вертикальные полосы вытянуты в разы сильнее горизонтальных. Tesseract
+    вертикальный текст замечает не всегда.
+
+    Args:
+        part: Фрагмент ячейки.
+        k: Длина ядра расширения, px.
+    """
     import cv2
     import numpy as np
 
     a = (np.array(part.convert("L")) < 128).astype(np.uint8)
 
     def elong(kernel, horiz: bool) -> float:
+        """Средняя вытянутость компонент после расширения, взвешенная по площади."""
         _, _, st, _ = cv2.connectedComponentsWithStats(cv2.dilate(a, kernel))
         num = den = 0.0
         for _x, _y, w, h, area in st[1:]:
@@ -205,10 +274,15 @@ def is_vertical(part: Image.Image, k: int = 15) -> bool:
 
 
 def _try_cell(ask: AskFn, crop: Image.Image, d: dict) -> dict:
-    # вертикальный текст — читаем повёрнутым, сторону (±90°) выбирает уверенность модели: в неверной
-    # она пишет бессмыслицу с низкой уверенностью. Горизонтальный — как есть; если в ячейке без текста
-    # Tesseract ответ негоден, пробуем и повороты (227 стр. 9: повёрнутая цифра нумерации «5»)
+    """Попытка 1: чтение фрагмента ячейки.
+
+    Вертикальный текст читается повёрнутым, сторону (±90°) выбирает
+    уверенность модели. Горизонтальный — как есть; если у Tesseract в ячейке
+    текста нет и ответ отбракован, пробуются и повороты (повёрнутая цифра).
+    """
+
     def read(rot: int) -> dict:
+        """Читает ячейку, повёрнутую на ``rot`` градусов."""
         raw, reason, lp = ask(cell_image(crop, d, rot), "Free OCR.")
         text = clean(raw)
         got = _keep_ds(accept(text, d, lp) if reason != "length" else None, lp, d)
@@ -223,6 +297,7 @@ def _try_cell(ask: AskFn, crop: Image.Image, d: dict) -> dict:
 
 
 def _try_pair(ask: AskFn, crop: Image.Image, d: dict) -> dict:
+    """Попытка 2: чтение ячейки вместе с соседней слева."""
     if not d.get("left") or d.get("rot"):
         return {"skip": True}
     raw, reason, lp = ask(pair_image(crop, d), "Free OCR.")
@@ -231,6 +306,7 @@ def _try_pair(ask: AskFn, crop: Image.Image, d: dict) -> dict:
 
 
 def _try_cell_md(ask: AskFn, crop: Image.Image, d: dict) -> dict:
+    """Попытка 3: фрагмент ячейки с запросом на markdown."""
     if d.get("kind") == "mismatch":
         return {"skip": True}
     raw, reason, lp = ask(cell_image(crop, d), "Convert the document to markdown.")
@@ -242,9 +318,19 @@ ATTEMPTS = (("cell", _try_cell), ("pair", _try_pair), ("cell_md", _try_cell_md))
 
 
 def reread_cells(crop: Image.Image, doubt: list[dict], ask: AskFn = deepseek_ask) -> dict[tuple[int, int], str]:
-    """Дочитка сомнительных ячеек таблицы. crop — кроп таблицы, в координатах которого заданы рамки
-    ячеек doubt (vlm_tables.GridResult.doubt). Возвращает принятый текст по (строка, столбец).
-    vlm_tables.VlmUnavailable пробрасывается."""
+    """Повторно читает сомнительные ячейки таблицы.
+
+    Args:
+        crop: Фрагмент таблицы; рамки ячеек заданы в его координатах.
+        doubt: Сомнительные ячейки (``GridResult.doubt``).
+        ask: Запрос к модели; по умолчанию :func:`deepseek_ask`.
+
+    Returns:
+        Принятый текст по позиции ``(строка, столбец)``.
+
+    Raises:
+        VlmUnavailable: vLLM недоступен.
+    """
     results: list[dict] = [{"used": None} for _ in doubt]
     todo = list(range(len(doubt)))
     for _name, attempt in ATTEMPTS:

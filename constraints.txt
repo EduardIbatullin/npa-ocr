@@ -1,4 +1,4 @@
-# Версии, с которыми образ собран и проверен (pip freeze рабочего образа на nv-02, 2026-10-28).
+# Версии, с которыми образ собран и проверен (pip freeze рабочего образа).
 # Dockerfile ставит зависимости с -c constraints.txt: сборка с нуля даёт те же версии.
 # Обновление: собрать без -c, проверить, затем
 #   docker run --rm --entrypoint pip npa-ocr freeze --exclude-editable > constraints.txt

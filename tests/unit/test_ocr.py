@@ -1,4 +1,4 @@
-"""Тесты точки входа OCR → DOCX (гибридная схема, см. docs/plan.md и
+"""Тесты точки входа OCR → DOCX (гибридная схема, см. docs/history/plan.md и
 модуль npa_ocr.ocr). Движки — фейковые функции на реальных фикстурах/данных,
 без загрузки тяжёлых моделей."""
 
@@ -229,7 +229,7 @@ def test_expected_signatory_title_known_authorities():
     )
     assert expected_signatory_title("Федеральная служба по аккредитации") == "Руководитель"
     # Министерства пока не поддержаны — склонение названия ведомства не выводится
-    # надёжно без риска угадывания (см. docs/plan.md).
+    # надёжно без риска угадывания (см. docs/history/plan.md).
     assert expected_signatory_title("Министерство природных ресурсов") is None
     assert expected_signatory_title("Неизвестный орган") is None
 
@@ -385,7 +385,7 @@ def test_run_tesseract_text_does_not_touch_clean_lines_or_unrelated_damage():
 def test_run_tesseract_text_applies_known_ocr_corrections_like_table_text():
     # normalize_header_text (известные искажения OCR — смесь латиницы/кириллицы,
     # «Γ.» вместо «г.») раньше применялся только к тексту таблиц; те же классы
-    # ошибок встречаются и в обычном тексте страницы (см. docs/plan.md, 2026-10-24).
+    # ошибок встречаются и в обычном тексте страницы (см. docs/history/plan.md, 2026-10-24).
     data = _tesseract_data(
         [
             ("Cpoк", 95, 10, 10, 100, 20),  # «Cpoк» -> «Срок», тот же словарь, что и у таблиц
@@ -451,7 +451,7 @@ def test_recover_bottom_gap_text_adds_confident_word_from_bottom_gap(monkeypatch
     # Основной проход нашёл текст только до y=100 из 1000 — разрыв 90% высоты,
     # явно больше порога _BOTTOM_GAP_RATIO. Повторный проход (замоканный)
     # находит уверенное слово — должно быть дописано со сдвигом Y на отступ кропа
-    # и с block_num, не совпадающим с уже существующими (см. docs/plan.md,
+    # и с block_num, не совпадающим с уже существующими (см. docs/history/plan.md,
     # «Министр ... Козлов», Приказ №215).
     import pytesseract
 
@@ -517,7 +517,7 @@ def test_run_tesseract_text_without_detect_marks_fn_is_unaffected():
 
 
 def test_run_tesseract_text_escalates_low_confidence_words_under_covering_mark(tmp_path: Path):
-    # Сценарий из docs/plan.md: эвристика нашла кандидата (скопление
+    # Сценарий из docs/history/plan.md: эвристика нашла кандидата (скопление
     # низкоуверенных слов), detect_marks_fn (фейк) подтверждает — это печать,
     # перекрывающая текст документа; recover_covered_text_fn (фейк) отдаёт
     # восстановленный текст. Результат остаётся low=True — проверять руками.
@@ -551,7 +551,7 @@ def test_run_tesseract_text_escalates_low_confidence_words_under_covering_mark(t
 
 
 def test_run_tesseract_text_rejects_escalation_answer_shorter_than_low_word_count(tmp_path: Path):
-    # Реальный дефект, Приказ №215, стр. 1 (docs/plan.md, «штампы просачиваются
+    # Реальный дефект, Приказ №215, стр. 1 (docs/history/plan.md, «штампы просачиваются
     # в текст»): bbox метки, найденный по скоплению низкоуверенных слов,
     # захватил не только штамп, но и край настоящей строки шапки документа
     # («И ЭКОЛОГИИ» в «МИНИСТЕРСТВО ПРИРОДНЫХ РЕСУРСОВ И ЭКОЛОГИИ») — на эту
@@ -600,7 +600,7 @@ def test_run_tesseract_text_rejects_escalation_answer_shorter_than_low_word_coun
 
 
 def test_run_tesseract_text_drops_words_inside_non_covering_e_signature_mark(tmp_path: Path):
-    # Пример Постановление №710 (docs/plan.md): штамп электронной подписи внизу
+    # Пример Постановление №710 (docs/history/plan.md): штамп электронной подписи внизу
     # страницы — чистый визуальный мусор, не текст документа, не перекрывает
     # ничего содержательного. Слова внутри такой метки исключаются целиком, а
     # не просто выделяются как низкая уверенность.
@@ -1023,7 +1023,7 @@ def test_run_tatr_tables_drops_duplicate_texts_from_overlapping_table_entries(tm
     def fake_text(_crop_path):
         # две записи таблиц на одном кропе содержат одну и ту же строку;
         # второй столбец с текстом — иначе drop_empty_columns схлопывает
-        # сетку до 1x1 и is_plausible_table её отбраковывает (см. docs/plan.md)
+        # сетку до 1x1 и is_plausible_table её отбраковывает (см. docs/history/plan.md)
         same = {
             "rec_boxes": [[10, 10, 140, 40], [160, 10, 290, 40]],
             "rec_texts": ["Ячейка", "Вторая"],
@@ -1064,7 +1064,7 @@ def test_run_tatr_tables_recognizes_each_cell_separately_when_cell_fn_given(tmp_
                     "table_ocr_pred": {
                         # второй столбец с текстом — иначе drop_empty_columns
                         # схлопывает сетку до 1x1 и is_plausible_table её
-                        # отбраковывает (см. docs/plan.md)
+                        # отбраковывает (см. docs/history/plan.md)
                         "rec_boxes": [[10, 10, 90, 40], [160, 10, 240, 40]],
                         "rec_texts": ["x", "y"],
                     }
@@ -1362,7 +1362,7 @@ def test_table_cells_from_img2table_merges_repeated_bbox_into_span():
 
 
 def test_merge_img2table_fragment_rows_joins_real_split_cell_from_order_215():
-    # Реальные данные (Приказ №215, стр. 4, см. docs/plan.md, 2026-10-24):
+    # Реальные данные (Приказ №215, стр. 4, см. docs/history/plan.md, 2026-10-24):
     # img2table разбил ячейку «Углерода оксид (углерод окись; углерод
     # моноокись; угарный газ)» на 4 отдельные "строки" без реальной линии-
     # разделителя между ними в самой таблице.
@@ -1494,7 +1494,7 @@ def test_run_tatr_tables_uses_img2table_fallback_when_region_is_clipped(tmp_path
 
     def fake_text(_crop_path):
         # два слова (второй столбец — иначе сетка схлопывается до 1x1 и
-        # отбраковывается is_plausible_table, см. docs/plan.md); вместе занимают
+        # отбраковывается is_plausible_table, см. docs/history/plan.md); вместе занимают
         # только левую часть кропа — итоговый bbox TATR узкий, правый отступ от
         # ширины страницы (1000px) превышает порог 0.20
         return {
@@ -1572,7 +1572,7 @@ def test_run_tatr_tables_keeps_tatr_result_when_img2table_candidate_is_not_wider
 
 
 def test_run_tatr_tables_falls_back_to_img2table_when_tatr_finds_no_region_at_all(tmp_path: Path):
-    """Реальный случай — Приказ №215, стр. 5 (docs/plan.md, «таблица на последней
+    """Реальный случай — Приказ №215, стр. 5 (docs/history/plan.md, «таблица на последней
     странице не находится»): честный хвост многостраничной таблицы, TATR не
     находит там region ни на одном безопасном пороге (`region_fn` возвращает
     []). В отличие от уже проверенного случая «узкий принятый регион» выше,
@@ -1607,7 +1607,7 @@ def test_run_tatr_tables_does_not_fall_back_to_img2table_when_tatr_region_was_re
     """Отличает «TATR не нашёл ничего» (fallback выше) от «TATR нашёл регион, но
     он отвергнут как неправдоподобный» — для второго случая понижение порога
     уже проверено и признано опасным (Постановление №710, стр. 13: обычный
-    формульный текст даёт ложные «таблицы», см. docs/plan.md, «таблица на
+    формульный текст даёт ложные «таблицы», см. docs/history/plan.md, «таблица на
     последней странице»). region_fn здесь возвращает регион (TATR что-то
     нашёл), но структура настолько вырождена (1x1 без текста), что
     is_plausible_table его отбросит — img2table-fallback в этой ветке

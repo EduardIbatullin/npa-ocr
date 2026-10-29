@@ -1,5 +1,5 @@
 """Тесты разбора ответа Ollama (ai_escalation.py) — сетевая часть (_call_ollama)
-не тестируется юнит-тестами (см. docs/plan.md — проверено вручную на реальном
+не тестируется юнит-тестами (см. docs/history/plan.md — проверено вручную на реальном
 сервере, не на CI)."""
 
 from __future__ import annotations

@@ -1,5 +1,5 @@
 """Тесты детектора печатей/штампов/э-подписей (mark_detection.py, см.
-docs/plan.md «ИИ-эскалация»). classify_fn — фейк, без реальных вызовов VLM."""
+docs/history/plan.md «ИИ-эскалация»). classify_fn — фейк, без реальных вызовов VLM."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def test_cluster_candidate_regions_keeps_far_apart_words_separate():
 
 def test_cluster_candidate_regions_drops_clusters_below_min_words():
     # Одно случайно испорченное слово посреди страницы — не кандидат, слишком
-    # частый шум обычного OCR, не повод тратить вызов VLM (см. docs/plan.md).
+    # частый шум обычного OCR, не повод тратить вызов VLM (см. docs/history/plan.md).
     boxes = [(500.0, 500.0, 540.0, 520.0)]
     assert cluster_candidate_regions(boxes, min_words=2) == []
 

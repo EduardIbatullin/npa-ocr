@@ -1,7 +1,7 @@
 """Тесты detect_table_regions (выбор меток/порога) — модель TATR подменяется
 фейком, но сама функция использует torch.no_grad() безусловно, поэтому эти
 тесты (в отличие от test_table_structure.py) требуют torch и пропускаются
-там, где его нет (см. docs/plan.md «Приказ №191», 2026-10-23)."""
+там, где его нет (см. docs/history/plan.md «Приказ №191», 2026-10-23)."""
 
 from __future__ import annotations
 
