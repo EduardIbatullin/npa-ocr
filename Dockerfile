@@ -45,7 +45,7 @@ RUN pip install --no-cache-dir -c constraints.txt torch torchvision \
 # Зависимости отдельно — слой кэшируется при неизменном pyproject.toml.
 # server — HTTP API (npa_ocr.server), см. README, «HTTP API».
 # Ставятся до копирования кода, по заглушкам пакета и README: иначе любая правка src или
-# README заново качала бы все зависимости (на nv-02 — 100 мин, 2026-10-27). Установка
+# README заново загружала бы все зависимости (при медленной сети — больше часа). Установка
 # editable — пакет читается из /app/src, настоящий код ложится туда ниже.
 COPY pyproject.toml ./
 RUN mkdir -p src/npa_ocr && touch src/npa_ocr/__init__.py README.md \
@@ -61,7 +61,7 @@ RUN python scripts/preload_models.py
 
 EXPOSE 8000
 
-# По умолчанию — CLI (см. README, «CLI»): PDF и результат передаются томом.
+# По умолчанию — CLI (см. README, «Командная строка»): PDF и результат передаются томом.
 #   docker run --rm -v "$PWD":/data npa-ocr /data/scan.pdf --out /data/out.docx
 # Сервер (HTTP API, см. README, «HTTP API») — тот же образ, другой вход:
 #   docker run --rm -p 8000:8000 --entrypoint uvicorn npa-ocr \

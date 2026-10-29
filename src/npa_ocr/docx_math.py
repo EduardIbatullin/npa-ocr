@@ -1,8 +1,12 @@
-"""Формулы и индексы в DOCX: LaTeX DeepSeek-OCR → MathML (latex2mathml) → OMML (mathml2omml) —
-настоящая формула Word, редактируемая; <sub>/<sup> — подстрочный/надстрочный шрифт.
+"""Формулы и индексы в DOCX.
 
-Формула, которую не удалось перевести, идёт в DOCX как есть (LaTeX текстом, жёлтым) — текст не
-теряется, а место видно при проверке."""
+LaTeX переводится в редактируемую формулу Word по цепочке LaTeX → MathML
+(latex2mathml) → OMML (mathml2omml). Разметка ``<sub>``/``<sup>`` становится
+подстрочным и надстрочным шрифтом.
+
+Формула, которую не удалось перевести, пишется в документ исходным LaTeX и
+выделяется жёлтым: текст не теряется, а место видно при проверке.
+"""
 
 from __future__ import annotations
 
@@ -18,7 +22,14 @@ _PART_RE = re.compile(r"\\\((.*?)\\\)|<sub>(.*?)</sub>|<sup>(.*?)</sup>|([^\\<]+
 
 
 def latex_to_omml(latex: str) -> etree._Element | None:
-    """m:oMath для LaTeX; None — не удалось перевести."""
+    """Переводит LaTeX в элемент ``m:oMath``.
+
+    Args:
+        latex: Формула LaTeX без ограничителей ``\\[ \\]`` и ``\\( \\)``.
+
+    Returns:
+        Элемент ``m:oMath`` или None, если формулу не удалось перевести.
+    """
     import latex2mathml.converter
     import mathml2omml
 
@@ -32,7 +43,12 @@ def latex_to_omml(latex: str) -> etree._Element | None:
 
 
 def add_formula(doc, latex: str) -> None:
-    """Формула отдельным абзацем по центру."""
+    """Добавляет формулу в документ отдельным абзацем по центру.
+
+    Args:
+        doc: Документ python-docx.
+        latex: Формула LaTeX без ограничителей.
+    """
     para = doc.add_paragraph()
     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     math = latex_to_omml(latex)
@@ -45,8 +61,16 @@ def add_formula(doc, latex: str) -> None:
 
 
 def add_rich(para, markup: str, low: bool) -> None:
-    """Слово с разметкой DeepSeek в абзац: части текста — прогонами (индексы — подстрочным и
-    надстрочным шрифтом), \\(LaTeX\\) — формулой Word в строке."""
+    """Добавляет в абзац слово с разметкой.
+
+    Обычный текст и индексы пишутся прогонами (индексы — подстрочным и
+    надстрочным шрифтом), ``\\(LaTeX\\)`` — формулой Word в строке.
+
+    Args:
+        para: Абзац python-docx.
+        markup: Слово с разметкой ``<sub>``, ``<sup>`` и ``\\(…\\)``.
+        low: Выделить слово жёлтым как неуверенно распознанное.
+    """
     for m in _PART_RE.finditer(markup):
         latex, sub, sup, text = m.groups()
         if latex is not None:

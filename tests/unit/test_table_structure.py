@@ -254,7 +254,7 @@ def test_join_fragment_lines_does_not_glue_overlapping_adjacent_words():
     # «Взвешенные вещества») — два РАЗНЫХ слова, но их боксы слегка
     # перекрываются по x (gap = 227-238 = -11), раньше это читалось как один
     # разорванный токен и склеивалось без пробела («Взвешенныевещества»),
-    # см. docs/plan.md.
+    # см. docs/history/plan.md.
     items = [
         ((9.0, 30.0, 238.0, 79.0), "Взвешенные", 0.98892),
         ((227.0, 36.0, 396.0, 79.0), "вещества", 0.9904),
@@ -278,7 +278,7 @@ def test_join_fragment_lines_drops_duplicate_superscript_box():
     # детектируется дважды: один раз внутри основного бокса («MΓ/HM3»), и ещё
     # раз отдельным мелким боксом вокруг того же символа (~86% перекрытия
     # площади с основным боксом). Второй бокс должен быть отброшен целиком —
-    # ни с пробелом, ни без, см. docs/plan.md.
+    # ни с пробелом, ни без, см. docs/history/plan.md.
     items = [
         ((26.0, 18.0, 147.0, 77.0), "MΓ/HM3", 0.9),
         ((128.0, 22.0, 150.0, 48.0), "3", 0.9),
@@ -311,7 +311,7 @@ def test_is_plausible_table_rejects_real_false_positive_from_tatr_detection():
     # bbox=[165,1733,1607,2150]) — TATR (table-transformer-detection) дал
     # score=0.862 на нижней части страницы (конец пункта 3 + строка подписи
     # министра), приняв её за таблицу 5x12. На самом деле «столбцы» —
-    # случайные межсловные пробелы одной строки текста (см. docs/plan.md).
+    # случайные межсловные пробелы одной строки текста (см. docs/history/plan.md).
     text_by_pos = {
         (0, 0): "(зарегистрирован", (0, 2): "Министерством", (0, 4): "юстициИ",
         (0, 7): "Российской", (0, 11): "Федерации",
@@ -378,7 +378,7 @@ def test_is_plausible_table_rejects_1x1_grid():
 def test_is_plausible_table_does_not_reject_other_small_grids():
     # Сетки меньше 2x2, но не 1x1 (одна строка из многих столбцов или один
     # столбец из многих строк) — по-прежнему вне охвата проверки по
-    # заполненности столбцов, см. docs/plan.md.
+    # заполненности столбцов, см. docs/history/plan.md.
     row_cells = [TableCell(row=0, col=c, row_span=1, col_span=1, text=str(c)) for c in range(5)]
     assert is_plausible_table(row_cells, 1, 5) is True
 
@@ -388,7 +388,7 @@ def test_is_plausible_table_does_not_reject_other_small_grids():
 
 def test_merge_overlapping_table_regions_collapses_real_duplicate_detections():
     # Реальный документ (Постановление №1430, стр. 6): DETR-детектор TATR
-    # выдал одну таблицу как 5 перекрывающихся регионов (см. docs/plan.md,
+    # выдал одну таблицу как 5 перекрывающихся регионов (см. docs/history/plan.md,
     # 2026-10-24) — без слияния это дало бы 5-кратное дублирование таблицы
     # в итоговом docx. Координаты — реальные, из того прогона.
     boxes = [

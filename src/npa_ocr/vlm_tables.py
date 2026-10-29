@@ -1,31 +1,36 @@
-"""Таблицы страницы через DeepSeek-OCR (vLLM на GPU) со структурой по линиям скана —
-замена медленного пути TATR + PaddleOCR/RapidOCR на CPU (3–9 мин на табличную страницу
-против ~7 с). Перенесено из спайка npa-vlm-ocr (scripts/spike.py, table_grid.py; README и
-docs/integration-plan.md там же — разметка 117 таблиц 14 документов: 113 верно, 4 с мелкими
-ошибками).
+"""Таблицы страницы через DeepSeek-OCR (vLLM на GPU) со структурой по линиям скана.
 
-DeepSeek-OCR по всей странице отдаёт блоки «<|ref|>table<|/ref|><|det|>[[x1, y1, x2, y2]]<|/det|>»
-с HTML таблицы. Текст ячеек она читает дословно, но объединённые ячейки отдаёт пустыми клетками,
-текст объединения ставит туда, где он виден (посередине группы), а иногда теряет или
-добавляет клетку. Таблицы НПА разлинованы, поэтому сетку берём из самого скана:
+Работает быстрее пути TATR + PaddleOCR/RapidOCR на CPU: секунды на табличную
+страницу вместо минут.
 
-1. линии — морфологией (длинные горизонтальные/вертикальные штрихи), ячейки — связные области
-   между линиями; объединённая ячейка получается одной областью сама;
-2. границы строк/столбцов — кластеры краёв ячеек, отсюда rowspan/colspan;
-3. текст: Tesseract (одним вызовом, слова по координатам) даёт черновой текст каждой ячейки,
-   по нему ячейки DeepSeek выравниваются на ячейки сетки (жадно по похожести и положению +
-   добор); в таблицу идёт текст DeepSeek, Tesseract — только для сопоставления.
+DeepSeek-OCR отдаёт по странице блоки
+``<|ref|>table<|/ref|><|det|>[[x1, y1, x2, y2]]<|/det|>`` с HTML таблицы. Текст
+ячеек модель читает дословно, но объединённые ячейки отдаёт пустыми клетками,
+ставит текст объединения туда, где он виден, и иногда теряет или добавляет
+клетку. Таблицы актов разлинованы, поэтому сетка берётся из самого скана:
 
-Если сетка не построилась или не вместила текст DeepSeek (таблица без линий в теле,
-Постановление №1430) — берётся HTML DeepSeek как есть. Ячейки, где текст есть только от
-Tesseract или поставлен лишь по положению, помечаются низкой уверенностью (low_lines) —
-DOCX подсвечивает их жёлтым. Такие ячейки (и «чернила» без текста, и текст DeepSeek, не похожий
-на Tesseract) дочитываются по кропу ячейки — vlm_reread.py; принятый текст пометку снимает.
+1. Линии выделяются морфологией (длинные горизонтальные и вертикальные
+   штрихи), ячейки — связные области между ними; объединённая ячейка сразу
+   получается одной областью.
+2. Границы строк и столбцов — кластеры краёв ячеек; отсюда объединения.
+3. Tesseract даёт черновой текст каждой ячейки; по нему ячейки DeepSeek
+   сопоставляются ячейкам сетки (жадно по похожести и положению, затем
+   добор). В таблицу идёт текст DeepSeek, Tesseract нужен только для
+   сопоставления.
 
-Сетевой адрес vLLM — переменная окружения VLLM_URL (OpenAI-совместимый /v1), модель —
-VLLM_MODEL (served-model-name в vLLM). В сервисе это адрес шлюза vlm_gate.py: он поднимает
-остановленный vLLM по первому запросу (холодный старт ~2–3 мин) и останавливает его после
-простоя — GPU на сервере общая. Отсюда большой VLLM_TIMEOUT.
+Если сетка не построилась или не вместила текст DeepSeek (например, у таблицы
+нет линий в теле), берётся HTML DeepSeek как есть. Ячейки с текстом только от
+Tesseract или поставленным по положению помечаются как неуверенные и
+выделяются в DOCX жёлтым. Такие ячейки, а также пустые ячейки с напечатанным
+текстом и ячейки, где DeepSeek и Tesseract расходятся, читаются повторно
+(:mod:`npa_ocr.vlm_reread`); принятый текст пометку снимает.
+
+Переменные окружения:
+    VLLM_URL: Адрес OpenAI-совместимого API vLLM (``…/v1``), обычно шлюза
+        :mod:`npa_ocr.vlm_gate`.
+    VLLM_MODEL: Имя модели в vLLM (``served-model-name``).
+    VLLM_TIMEOUT: Таймаут запроса, с. Велик, потому что шлюз может запускать
+        остановленный vLLM несколько минут.
 """
 
 from __future__ import annotations
@@ -50,13 +55,13 @@ from npa_ocr.ocr_table import TableCell
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001/v1")
 VLLM_MODEL = os.environ.get("VLLM_MODEL", "deepseek-ocr")
-# холодный старт vLLM через шлюз (до 10 мин ожидания) + сама страница (~7–60 с)
+# холодный старт vLLM через шлюз (до 10 мин) и распознавание страницы (до минуты)
 VLLM_TIMEOUT = float(os.environ.get("VLLM_TIMEOUT", "900"))
 
 # Промпт режима «документ с координатами блоков» (рецепт DeepSeek-OCR)
 DEEPSEEK_PROMPT = "<|grounding|>Convert the document to markdown."
-# Длинная таблица на всю страницу — ~4000 токенов; от зацикливания страхует только этот предел
-# (NGramPerReqLogitsProcessor из рецепта не совместим с vLLM 0.32)
+# Таблица во всю страницу — около 4000 токенов. Предел страхует от зацикливания генерации:
+# NGramPerReqLogitsProcessor из рецепта DeepSeek-OCR несовместим с используемой версией vLLM
 MAX_TOKENS = 6144
 # Координаты блоков DeepSeek — в долях 0..999 от размера страницы
 _DS_SCALE = 999.0
@@ -68,12 +73,24 @@ _MAX_LOST_SHARE = 0.1
 
 
 class VlmUnavailable(RuntimeError):
-    """vLLM (или шлюз перед ним) не ответил: не поднят, не хватило памяти GPU, таймаут."""
+    """vLLM или шлюз перед ним не ответил: не запущен, не хватило видеопамяти, таймаут."""
 
 
 def deepseek_chat(image: Image.Image) -> str:
-    """Ответ DeepSeek-OCR на страницу. skip_special_tokens=False обязателен: <tr>/<td> у
-    DeepSeek-OCR — спецтокены, без него структура таблицы теряется (так было в Ollama)."""
+    """Распознаёт страницу DeepSeek-OCR в режиме блоков с координатами.
+
+    ``skip_special_tokens=False`` обязателен: ``<tr>``/``<td>`` у DeepSeek-OCR —
+    служебные токены, без них теряется структура таблиц.
+
+    Args:
+        image: Изображение страницы.
+
+    Returns:
+        Ответ модели: Markdown с блоками ``<|ref|>…<|det|>``.
+
+    Raises:
+        VlmUnavailable: vLLM недоступен или ответ не разобран.
+    """
     buf = io.BytesIO()
     image.save(buf, format="PNG")
     payload = {
@@ -99,23 +116,37 @@ def deepseek_chat(image: Image.Image) -> str:
         raise VlmUnavailable(f"vLLM ({VLLM_URL}) недоступен: {exc}") from exc
 
 
-# Ollama вырезает служебные токены, и метка приходит как «table[[x1, y1, x2, y2]]» — поддерживаем оба вида
+# Без служебных токенов метка выглядит как «table[[x1, y1, x2, y2]]» — поддерживаются оба вида
 _DS_BLOCK_RE = re.compile(
     r"(?:<\|ref\|>(\w+)<\|/ref\|><\|det\|>|^(\w+))(\[\[[\d,\s\[\]]*?\]\])(?:<\|/det\|>)?", re.S | re.M)
 
 
 @dataclass
 class DsTable:
+    """Таблица из ответа DeepSeek-OCR: рамка в пикселях страницы и HTML."""
+
     bbox: list[int]  # пиксели страницы
     html: str
 
 
 def parse_deepseek(raw: str, width: int, height: int) -> list[DsTable]:
-    """Таблицы из ответа DeepSeek-OCR. HTML может стоять не сразу за меткой table: между ними
-    бывает блок table_caption (Приказ №228, стр. 23) — берём текст до следующей метки table."""
+    """Извлекает таблицы из ответа DeepSeek-OCR.
+
+    HTML может стоять не сразу за меткой ``table``: между ними бывает блок
+    ``table_caption``. Поэтому HTML ищется до следующей метки ``table``.
+
+    Args:
+        raw: Ответ DeepSeek-OCR.
+        width: Ширина страницы, px.
+        height: Высота страницы, px.
+
+    Returns:
+        Таблицы с рамками в пикселях.
+    """
     matches = list(_DS_BLOCK_RE.finditer(raw))
 
     def label(m: re.Match) -> str:
+        """Метка блока в нижнем регистре."""
         return (m.group(1) or m.group(2) or "").lower()
 
     out = []
@@ -140,22 +171,28 @@ def parse_deepseek(raw: str, width: int, height: int) -> list[DsTable]:
 
 _SCRIPTS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉ᵢ", "01234567890123456789i")
 _DIGITS = re.compile(r"\d+")
-# латиница, похожая на кириллицу (после lower в norm): DeepSeek пишет «C4-C6» латиницей, Tesseract
-# (rus) — кириллицей; для сопоставления это одно и то же
+# латиница, похожая на кириллицу (после lower в norm): DeepSeek пишет «C4-C6» латиницей,
+# Tesseract — кириллицей; для сопоставления это одно и то же
 _HOMO = str.maketrans("abcehkmoptxy", "авсенкмортху")
 
 
 def norm(s: str) -> str:
-    """Убираем различия оформления, не смысла: пробелы (≤60 / ≤ 60), над/подстрочные цифры
-    (мг/нм³ / мг/нм3), виды тире, ё. Остаются настоящие расхождения букв и чисел."""
+    """Нормализует текст для сравнения.
+
+    Убирает различия оформления: пробелы, надстрочные и подстрочные цифры,
+    виды тире, «ё», регистр. Остаются только расхождения букв и чисел.
+    """
     s = s.translate(_SCRIPTS).replace("Ӏ", "I").replace("ё", "е").replace("_", "")
     s = re.sub(r"[–—−]", "-", s)
     return re.sub(r"\s+", "", s).lower()
 
 
 def sim(a: str, b: str) -> float:
-    """Похожесть текстов ячеек; цифры должны в основном совпасть: «≤ 60» и «≤ 240» — разные ячейки.
-    Сверка мягкая: Tesseract читает «≤ 0,35» как «50,35», «С6» как «Сб», «I» как «1»."""
+    """Похожесть текстов ячеек от 0 до 1.
+
+    Сравнение мягкое к типичным ошибкам Tesseract («С6» → «Сб», «I» → «1»),
+    но тексты с разными числами («≤ 60» и «≤ 240») считаются непохожими.
+    """
     a, b = norm(a).translate(_HOMO), norm(b).translate(_HOMO)
     if not a or not b:
         return 0.0
@@ -167,7 +204,7 @@ def sim(a: str, b: str) -> float:
 
 
 def _contained(part: str, whole: str) -> float:
-    """Доля символов part, найденных в whole по порядку."""
+    """Доля знаков ``part``, найденных в ``whole`` по порядку."""
     a, b = norm(part).translate(_HOMO), norm(whole).translate(_HOMO)
     if not a or not b:
         return 0.0
@@ -175,6 +212,7 @@ def _contained(part: str, whole: str) -> float:
 
 
 def _letters(s: str) -> int:
+    """Число букв в строке."""
     return sum(ch.isalpha() for ch in s)
 
 
@@ -183,11 +221,16 @@ _SUB = str.maketrans("0123456789", "₀₁₂₃₄₅₆₇₈₉")
 
 
 def cell_text(html: str) -> str:
-    """HTML ячейки -> текст для DOCX: <br> — перенос строки, цифры в <sup>/<sub> — надстрочные и
-    подстрочные символы («мг/нм³», «80¹»), остальная разметка убирается."""
+    """Переводит HTML ячейки в текст для DOCX.
+
+    ``<br>`` становится переносом строки, цифры в ``<sup>``/``<sub>`` —
+    надстрочными и подстрочными знаками («мг/нм³»), остальная разметка
+    удаляется.
+    """
     h = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
 
     def script(m: re.Match) -> str:
+        """Содержимое <sup>/<sub>: цифры — надстрочными или подстрочными знаками."""
         inner = re.sub(r"<[^>]+>", "", m.group(2))
         table = _SUP if m.group(1).lower() == "sup" else _SUB
         return inner.translate(table) if re.fullmatch(r"[\d+-]+", inner) else inner
@@ -202,6 +245,8 @@ def cell_text(html: str) -> str:
 
 @dataclass
 class _Cell:
+    """Ячейка сетки по линиям: рамка, позиция и сопоставленный текст."""
+
     x0: int
     y0: int
     x1: int
@@ -220,6 +265,7 @@ class _Cell:
 
 
 def _line_masks(gray):
+    """Маски горизонтальных и вертикальных линий разлиновки."""
     import cv2
 
     bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 31, 15)
@@ -235,6 +281,7 @@ def _line_masks(gray):
 
 
 def _cluster(values: list[int], tol: int) -> list[int]:
+    """Группирует близкие значения (шаг не больше ``tol``) и возвращает медианы групп."""
     import numpy as np
 
     out: list[list[int]] = []
@@ -247,6 +294,12 @@ def _cluster(values: list[int], tol: int) -> list[int]:
 
 
 def _detect_cells(img: Image.Image) -> tuple[list[_Cell], dict]:
+    """Строит сетку ячеек по линиям разлиновки.
+
+    Returns:
+        Ячейки по строкам и столбцам и сведения о сетке; ``info["ok"]`` —
+        сетка без перекрытий и дыр.
+    """
     import cv2
     import numpy as np
 
@@ -258,8 +311,8 @@ def _detect_cells(img: Image.Image) -> tuple[list[_Cell], dict]:
     if len(xs) == 0 or not vert.any() or not horiz.any():
         info["why"] = "мало линий"
         return [], info
-    # рамка по крайним точкам всех линий: в НПА у таблиц часто нет боковых рамок (1430), а на стыке
-    # страниц — верхней/нижней
+    # рамка по крайним точкам всех линий: у таблиц часто нет боковых линий, а на стыке
+    # страниц — верхней или нижней
     x_min, x_max = int(xs.min()), int(xs.max())
     y_min, y_max = int(ys.min()), int(ys.max())
     cv2.rectangle(lines, (x_min, y_min), (x_max, y_max), 255, 3)
@@ -278,11 +331,12 @@ def _detect_cells(img: Image.Image) -> tuple[list[_Cell], dict]:
     tol = 14
     xe = _cluster([c.x0 for c in cells] + [c.x1 for c in cells], tol)
     ye = _cluster([c.y0 for c in cells] + [c.y1 for c in cells], tol)
-    # край ячейки и край соседней разделены толщиной линии -> одна граница = пара близких краёв
+    # края соседних ячеек разделены толщиной линии: пара близких краёв — одна граница
     xe = _cluster(xe, 2 * tol)
     ye = _cluster(ye, 2 * tol)
 
     def idx(edges: list[int], v: int) -> int:
+        """Номер ближайшей границы."""
         return int(np.argmin([abs(e - v) for e in edges]))
 
     taken: dict[tuple[int, int], int] = {}
@@ -306,6 +360,12 @@ def _detect_cells(img: Image.Image) -> tuple[list[_Cell], dict]:
 
 
 def _tesseract_into_cells(img: Image.Image, cells: list[_Cell]) -> None:
+    """Заполняет черновой текст ячеек по Tesseract.
+
+    Слова раскладываются по ячейкам по центрам. Вертикальный текст в высоких
+    узких ячейках читается повёрнутым; направление выбирается по уверенности
+    Tesseract. Отмечаются ячейки с напечатанным текстом (``ink``).
+    """
     import cv2
     import numpy as np
     import pytesseract
@@ -345,7 +405,7 @@ def _tesseract_into_cells(img: Image.Image, cells: list[_Cell]) -> None:
                 lines.append([w])
         cells[k].tess = " ".join(" ".join(x[2] for x in sorted(line, key=lambda z: z[1])) for line in lines)
         cells[k].text_y = ws[0][0]
-    # вертикальный текст (шапки альбомных таблиц, 228): Tesseract его не видит — читаем ячейку повёрнутой
+    # вертикальный текст (шапки альбомных таблиц) Tesseract не видит — ячейка читается повёрнутой
     pil = Image.fromarray(clean)
     for c in cells:
         if c.y1 - c.y0 > 1.5 * (c.x1 - c.x0) and c.y1 - c.y0 > 150 and _letters(c.tess) < 4:
@@ -366,7 +426,7 @@ def _tesseract_into_cells(img: Image.Image, cells: list[_Cell]) -> None:
 
 
 class _Rows(HTMLParser):
-    """HTML-таблица -> строки ячеек (text, rowspan, colspan)."""
+    """Разбор HTML-таблицы в строки ячеек ``(текст, rowspan, colspan)``."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -395,6 +455,7 @@ class _Rows(HTMLParser):
 
 
 def _span(v: str | None) -> int:
+    """Значение rowspan/colspan; неверное или пустое — 1."""
     try:
         return max(1, int(v or 1))
     except ValueError:
@@ -403,12 +464,15 @@ def _span(v: str | None) -> int:
 
 @dataclass
 class _DsCell:
+    """Непустая ячейка DeepSeek: текст и позиция в сетке DeepSeek."""
+
     text: str
     r: float  # центр по строкам в сетке DeepSeek
     c: int
 
 
 def _ds_cells(html: str) -> list[_DsCell]:
+    """Непустые ячейки HTML DeepSeek с позициями с учётом объединений."""
     p = _Rows()
     p.feed(html)
     taken: set[tuple[int, int]] = set()
@@ -428,15 +492,18 @@ def _ds_cells(html: str) -> list[_DsCell]:
 
 
 def _cell_html(html: str) -> list[str]:
-    """Тексты ячеек DeepSeek с сохранением <sup>/<sub>/<br>."""
+    """HTML непустых ячеек DeepSeek с сохранением ``<sup>``/``<sub>``/``<br>``."""
     return [m for m in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", html, re.S) if m.strip()]
 
 
 def _numbering(cells: list[_Cell], ds: list[_DsCell], used_c: set[int], used_d: set[int]) -> None:
-    """Строка нумерации столбцов («1 2 … 14»): одиночные цифры похожим текстом не сопоставить
-    (227 стр. 10: «11» уехало, «9» пропало), а DeepSeek читает её верно. Ставим её по порядку в ту
-    строку сетки, где столько же ячеек и Tesseract видит в них короткие тексты. По порядку, а не по
-    номеру столбца: у DeepSeek столбцов бывает больше (228 стр. 25: выдуманные столбцы шапки)."""
+    """Сопоставляет строку нумерации столбцов («1 2 … 14»).
+
+    Одиночные цифры по похожести текста не сопоставить, а DeepSeek читает
+    нумерацию верно. Она ставится по порядку в строку сетки с тем же числом
+    ячеек и короткими текстами Tesseract. По порядку, а не по номеру столбца:
+    у DeepSeek бывают лишние столбцы.
+    """
     by_row: dict[int, list[int]] = {}
     for j, d in enumerate(ds):
         if d.r == int(d.r):
@@ -465,9 +532,15 @@ _VALUE = re.compile(r"[≤<>≥]?\s*\d+(?:[.,]\d+)?(?:\s*\([^)]*\))?")
 
 
 def _split_values(cells: list[_Cell], ds: list[_DsCell]) -> int:
-    """DeepSeek слила столбец значений в одну ячейку («≤ 4,1139 ≤ 0,1440 … ≤ 0,0023», 377 стр. 7),
-    а соседние ячейки того же столбца остались с текстом одного Tesseract. Раскладываем значения
-    по порядку в окно из подряд идущих ячеек столбца, если цифры каждого совпадают с Tesseract."""
+    """Раскладывает по ячейкам столбец значений, слитый DeepSeek в одну ячейку.
+
+    Значения («≤ 4,1139 ≤ 0,1440 …») раскладываются по порядку в подряд идущие
+    ячейки столбца, оставшиеся только с текстом Tesseract, если цифры каждого
+    значения совпадают с Tesseract.
+
+    Returns:
+        Число разложенных ячеек DeepSeek.
+    """
     n = 0
     for c in cells:
         if len(c.ds_ids) != 1:
@@ -505,10 +578,20 @@ def _split_values(cells: list[_Cell], ds: list[_DsCell]) -> int:
 
 
 def _align(cells: list[_Cell], ds: list[_DsCell], row_edges: list[int]) -> None:
-    """Жадное сопоставление ячеек DeepSeek ячейкам сетки: похожесть текста (DeepSeek против чернового
-    Tesseract) минус штраф за разницу положения — строка, где виден текст, в долях высоты таблицы и
-    столбец. Положение различает одинаковые тексты («мг/нм³» в каждой строке); текст объединённой
-    ячейки DeepSeek ставит туда, где он виден на скане, поэтому строку ячейки сетки берём по словам."""
+    """Сопоставляет ячейки DeepSeek ячейкам сетки.
+
+    Оценка пары — похожесть текста DeepSeek и чернового текста Tesseract за
+    вычетом штрафа за разницу положения (строки и столбца в долях таблицы).
+    Положение различает одинаковые тексты («мг/нм³» в каждой строке). Строка
+    ячейки сетки берётся по месту её текста: DeepSeek ставит текст объединения
+    туда, где он виден. Пары выбираются жадно, затем идут два добора: кусков
+    ячеек, разбитых DeepSeek, и ячеек, не прочитанных Tesseract, по положению.
+
+    Args:
+        cells: Ячейки сетки; результат пишется в их ``ds_ids`` и ``src``.
+        ds: Ячейки DeepSeek.
+        row_edges: Границы строк сетки по y.
+    """
     import numpy as np
 
     n_rows_g = max(len(row_edges) - 1, 1)
@@ -517,6 +600,7 @@ def _align(cells: list[_Cell], ds: list[_DsCell], row_edges: list[int]) -> None:
     n_cols_d = max((d.c for d in ds), default=0) + 1
 
     def g_row(c: _Cell) -> float:
+        """Строка сетки, где виден текст ячейки."""
         if c.text_y < 0:
             return c.r + (c.rs - 1) / 2
         r = int(np.searchsorted(row_edges, c.text_y, side="right")) - 1
@@ -535,7 +619,7 @@ def _align(cells: list[_Cell], ds: list[_DsCell], row_edges: list[int]) -> None:
             if s < 0.35:
                 continue
             if len(norm(d.text)) <= 3 and abs(yg - d.r / n_rows_d) > 1.5 / n_rows_g:
-                continue  # «5», «1», «А» есть в любой таблице — короткий текст только рядом со своим местом
+                continue  # короткий текст («5», «А») есть в любой таблице — только рядом со своим местом
             pairs.append((s - 0.6 * abs(yg - d.r / n_rows_d) - 0.3 * abs(xg - d.c / n_cols_d), k, j))
     for _, k, j in sorted(pairs, reverse=True):
         if k in used_c or j in used_d:
@@ -553,8 +637,8 @@ def _align(cells: list[_Cell], ds: list[_DsCell], row_edges: list[int]) -> None:
             if not c.tess:
                 continue
             if not c.ds_ids:
-                # пустая ячейка: кусок должен почти целиком читаться в её тексте (248 стр. 9 — одна
-                # ячейка из трёх абзацев, DeepSeek разбила её на три строки)
+                # пустая ячейка: кусок должен почти целиком читаться в её тексте (ячейку из
+                # нескольких абзацев DeepSeek разбивает на строки)
                 gain = sim(c.tess, d.text) if _contained(d.text, c.tess) >= 0.85 else 0.0
             else:
                 cur = " ".join(ds[i].text for i in sorted(c.ds_ids, key=lambda i: (ds[i].r, ds[i].c)))
@@ -585,6 +669,7 @@ def _align(cells: list[_Cell], ds: list[_DsCell], row_edges: list[int]) -> None:
         col_votes.setdefault(ds[j].c, []).append(cells[k].c)
 
     def med(v: list[int]) -> int:
+        """Медиана."""
         return sorted(v)[len(v) // 2]
 
     row_map = {r: med(v) for r, v in row_votes.items()}
@@ -593,6 +678,7 @@ def _align(cells: list[_Cell], ds: list[_DsCell], row_edges: list[int]) -> None:
     anchors = sorted(row_map)
 
     def map_row(r: int) -> int | None:
+        """Строка сетки для строки DeepSeek по опорным строкам или None."""
         if r in row_map:
             return row_map[r]
         above = [a for a in anchors if a < r]
@@ -623,38 +709,47 @@ def _align(cells: list[_Cell], ds: list[_DsCell], row_edges: list[int]) -> None:
 
 @dataclass
 class GridResult:
+    """Итог сборки таблицы по сетке."""
+
     ok: bool                      # сетка построена
     cells: list[TableCell]
     n_rows: int
     n_cols: int
     info: dict                    # ds_cells, ds_lost, ds_invented, tess_only, by_pos, split, why
-    # сомнительные ячейки для дочитки (vlm_reread.py): r, c, box (в координатах кропа), rot, tess,
-    # left (соседняя слева ячейка с текстом DeepSeek: box, text), kind (tess|empty|mismatch), ds
+    # сомнительные ячейки для повторного чтения (vlm_reread): r, c, box (в координатах кропа), rot,
+    # tess, left (соседняя слева ячейка с текстом DeepSeek: box, text), kind (tess|empty|mismatch), ds
     doubt: list[dict] = field(default_factory=list)
 
 
 def _plain(h: str) -> str:
+    """Текст HTML без тегов, с одиночными пробелами."""
     return " ".join(re.sub(r"<[^>]+>", " ", h).split())
 
 
 def _doubt_kind(c: _Cell) -> str | None:
-    """Сомнительная ячейка: текст только от Tesseract, «чернила» без текста или текст DeepSeek, не
-    похожий на то, что видит Tesseract (228 стр. 25: вертикальную шапку DeepSeek прочла плохо — «для
-    управления» вместо «для утилизации»)."""
+    """Вид сомнения в ячейке.
+
+    Returns:
+        ``"tess"`` — текст только от Tesseract; ``"empty"`` — напечатано, но
+        текста нет; ``"mismatch"`` — текст DeepSeek не похож на прочитанное
+        Tesseract; None — ячейка не сомнительна.
+    """
     if c.src == "tess":
         return "tess"
     if c.ink and not c.text:
         return "empty"
-    # вертикальный текст (Tesseract прочёл его с поворотом) DeepSeek читает заметно хуже: «для
-    # обращения» вместо «для обработки» — там проверяем любое расхождение
+    # вертикальный текст (Tesseract прочёл его с поворотом) DeepSeek читает заметно хуже —
+    # там сомнительно любое расхождение
     if c.src in ("ds", "pos") and _letters(c.tess) >= 4 and sim(c.tess, _plain(c.text)) < (0.95 if c.rot else 0.5):
         return "mismatch"
     return None
 
 
 def _doubt(cells: list[_Cell]) -> list[dict]:
+    """Описания сомнительных ячеек для повторного чтения (см. ``GridResult.doubt``)."""
+
     def left_of(c: _Cell) -> dict | None:
-        """Соседняя слева ячейка с текстом DeepSeek — контекст для дочитки."""
+        """Соседняя слева ячейка с текстом DeepSeek — контекст для повторного чтения."""
         k = next((x for x in cells if x.c + x.cs == c.c and x.r <= c.r < x.r + x.rs and x.src in ("ds", "pos")),
                  None)
         return {"box": [k.x0, k.y0, k.x1, k.y1], "text": _plain(k.text)} if k else None
@@ -669,7 +764,15 @@ def _doubt(cells: list[_Cell]) -> list[dict]:
 
 
 def rebuild(img: Image.Image, ds_html: str) -> GridResult:
-    """Сетка по линиям кропа таблицы + текст DeepSeek в её ячейках."""
+    """Собирает таблицу: сетка по линиям и текст DeepSeek в её ячейках.
+
+    Args:
+        img: Вырезанная таблица.
+        ds_html: HTML таблицы от DeepSeek.
+
+    Returns:
+        Итог сборки; при ``ok=False`` сетка не построилась.
+    """
     cells, info = _detect_cells(img)
     ds = _ds_cells(ds_html)
     if not info["ok"]:
@@ -690,12 +793,12 @@ def rebuild(img: Image.Image, ds_html: str) -> GridResult:
     n_split = _split_values(cells, ds)
     doubt = _doubt(cells)
     lost = [ds[j].text for j in range(len(ds)) if not any(j in c.ds_ids for c in cells)]
-    # повтор уже размещённого текста (DeepSeek дублирует «кг/т переработанного сырья» в выдуманных
-    # строках) — не потеря; потеря — текст, которого в итоговой таблице нет вовсе
+    # повтор уже размещённого текста (DeepSeek дублирует его в выдуманных строках) — не потеря;
+    # потеря — текст, которого в итоговой таблице нет вовсе
     placed_norm = {norm(ds[j].text) for c in cells for j in c.ds_ids}
     lost_unique = [t for t in lost if norm(t) not in placed_norm]
-    # текст DeepSeek, которого Tesseract на скане не видит вовсе, — выдуман (228 стр. 25: «Экологическая
-    # безопасность» в шапке); потеря — только то, что на скане есть, а в сетку не попало
+    # текст DeepSeek, которого Tesseract на скане не видит вовсе, выдуман; потеря — только то,
+    # что на скане есть, а в сетку не попало
     all_tess = " ".join(c.tess for c in cells)
     invented = [t for t in lost_unique if len(norm(t)) > 3 and _contained(t, all_tess) < 0.7]
     lost_unique = [t for t in lost_unique if t not in invented]
@@ -716,7 +819,11 @@ RereadFn = Callable[[Image.Image, list[dict]], dict[tuple[int, int], str]]
 
 
 def apply_reread(cells: list[TableCell], texts: dict[tuple[int, int], str]) -> list[TableCell]:
-    """Дочитанный текст — в ячейки; он проверен (vlm_reread.accept), поэтому без жёлтой пометки."""
+    """Подставляет в ячейки текст повторного чтения.
+
+    Текст уже проверен (:func:`npa_ocr.vlm_reread.accept`), поэтому пометка
+    неуверенности снимается.
+    """
     out = []
     for c in cells:
         t = texts.get((c.row, c.col))
@@ -725,7 +832,13 @@ def apply_reread(cells: list[TableCell], texts: dict[tuple[int, int], str]) -> l
 
 
 def html_cells(html: str) -> tuple[list[TableCell], int, int]:
-    """HTML DeepSeek как есть -> ячейки (запасной путь, когда сетка по линиям не годится)."""
+    """Переводит HTML DeepSeek в ячейки как есть.
+
+    Запасной путь, когда сетка по линиям не годится.
+
+    Returns:
+        Ячейки, число строк и число столбцов.
+    """
     cells: list[TableCell] = []
     taken: set[tuple[int, int]] = set()
     for r, row in enumerate(re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S | re.I)):
@@ -749,8 +862,17 @@ def html_cells(html: str) -> tuple[list[TableCell], int, int]:
 
 
 def refine_bbox(page: Image.Image, box: list[int], pad: int = 12) -> list[int]:
-    """Рамка таблицы по разлиновке страницы: DeepSeek иногда даёт рамку только вокруг шапки
-    (1430 стр. 8), а HTML — всей таблицы. Берём связные куски линий, задевающие её рамку."""
+    """Уточняет рамку таблицы по разлиновке страницы.
+
+    DeepSeek иногда даёт рамку только вокруг шапки, а HTML — всей таблицы.
+    Рамка расширяется до связных кусков линий, задевающих её и лежащих в
+    основном внутри неё с запасом.
+
+    Args:
+        page: Изображение страницы.
+        box: Рамка DeepSeek.
+        pad: Запас вокруг итоговой рамки, px.
+    """
     import cv2
     import numpy as np
 
@@ -776,6 +898,7 @@ def refine_bbox(page: Image.Image, box: list[int], pad: int = 12) -> list[int]:
 
 
 def _overlap(a: list[int], b: list[int]) -> float:
+    """Площадь пересечения рамок, отнесённая к площади меньшей."""
     ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
     iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
     small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
@@ -784,7 +907,7 @@ def _overlap(a: list[int], b: list[int]) -> float:
 
 @dataclass
 class VlmTable:
-    """Таблица страницы и как она получена (для отчёта о прогоне и дочитки ячеек)."""
+    """Таблица страницы и способ, которым она получена."""
 
     bbox: list[int]
     cells: list[TableCell]
@@ -796,9 +919,20 @@ class VlmTable:
 
 
 def page_tables(page: Image.Image, tables: list[DsTable], reread_fn: RereadFn | None = None) -> list[VlmTable]:
-    """Таблицы DeepSeek страницы -> итоговые таблицы. Таблицы DeepSeek, попавшие в одну разлиновку,
-    — одна таблица (1430 стр. 8: разрезана на две по строке-подзаголовку «II. При сбросе…»).
-    reread_fn — дочитка сомнительных ячеек таблиц по сетке (vlm_reread.reread_cells)."""
+    """Собирает итоговые таблицы страницы из таблиц DeepSeek.
+
+    Таблицы DeepSeek в одной разлиновке объединяются: DeepSeek разрезает
+    таблицу по строке-подзаголовку.
+
+    Args:
+        page: Изображение страницы.
+        tables: Таблицы из ответа DeepSeek.
+        reread_fn: Повторное чтение сомнительных ячеек
+            (:func:`npa_ocr.vlm_reread.reread_cells`) или None.
+
+    Returns:
+        Таблицы сверху вниз.
+    """
     boxes = [refine_bbox(page, t.bbox) for t in tables]
     groups: list[list[int]] = []
     for k, b in enumerate(boxes):
@@ -814,8 +948,8 @@ def page_tables(page: Image.Image, tables: list[DsTable], reread_fn: RereadFn | 
         html = "<table>" + "".join(re.sub(r"</?table[^>]*>", "", tables[i].html) for i in g) + "</table>"
         crop = page.crop(box)
         res = rebuild(crop, html)
-        # итог: сетка по линиям, если она вместила текст DeepSeek; иначе (таблица без линий в теле,
-        # как 1430 стр. 8, или сетка не построилась) — HTML DeepSeek как есть
+        # сетка по линиям, если она вместила текст DeepSeek; иначе (нет линий в теле таблицы
+        # или сетка не построилась) — HTML DeepSeek как есть
         if res.ok and res.info["ds_lost"] <= _MAX_LOST_SHARE * max(res.info["ds_cells"], 1):
             cells = res.cells
             if reread_fn is not None and res.doubt:
@@ -839,11 +973,20 @@ def page_tables(page: Image.Image, tables: list[DsTable], reread_fn: RereadFn | 
 
 def extend_to_rows(page: Image.Image, box: list[int], cells: list[TableCell], limit_y: int,
                    pad: int = 12) -> list[int]:
-    """Продлевает рамку вниз по строкам текста страницы, которые есть в таблице: строка Tesseract
-    должна читаться (по порядку символов) в тексте строки таблицы — той же, что предыдущая, или
-    ниже (строки таблицы идут по порядку). Первая чужая строка — конец таблицы. Порядок важен:
-    1430 стр. 8 — подзаголовок «II. При сбросе … категории Б» вне этой таблицы почти дословно
-    совпадает с её строкой «I. При сбросе … категории А», но та уже пройдена."""
+    """Продлевает рамку таблицы вниз по строкам текста страницы, входящим в таблицу.
+
+    Строка Tesseract должна читаться в тексте строки таблицы — той же, что
+    предыдущая, или ниже. Первая чужая строка заканчивает таблицу. Порядок
+    важен: текст под таблицей может почти дословно повторять её уже пройденную
+    строку.
+
+    Args:
+        page: Изображение страницы.
+        box: Рамка таблицы.
+        cells: Ячейки таблицы.
+        limit_y: Нижний предел (начало следующей таблицы или низ страницы).
+        pad: Запас под последней строкой, px.
+    """
     import pytesseract
 
     from npa_ocr.ocr import _resolve_tesseract_cmd
@@ -883,9 +1026,19 @@ def run_vlm_tables(
     chat_fn: Callable[[Image.Image], str] = deepseek_chat,
     reread_fn: RereadFn | None = None,
 ) -> list[VlmTable]:
-    """Таблицы страницы-скана: DeepSeek-OCR по всей странице + сетка по линиям (+ дочитка
-    сомнительных ячеек, если задан reread_fn). chat_fn — инъекция модели (в тестах — сохранённые
-    ответы DeepSeek)."""
+    """Распознаёт таблицы страницы-скана.
+
+    Args:
+        image_path: Изображение страницы.
+        chat_fn: Запрос к DeepSeek-OCR; по умолчанию :func:`deepseek_chat`.
+        reread_fn: Повторное чтение сомнительных ячеек или None.
+
+    Returns:
+        Таблицы страницы.
+
+    Raises:
+        VlmUnavailable: vLLM недоступен.
+    """
     page = Image.open(image_path).convert("RGB")
     raw = chat_fn(page)
     return page_tables(page, parse_deepseek(raw, page.width, page.height), reread_fn)

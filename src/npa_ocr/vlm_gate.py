@@ -1,23 +1,31 @@
-"""Шлюз перед vLLM: поднимает его по первому запросу и останавливает после простоя.
+"""Шлюз перед vLLM: запускает его по первому запросу и останавливает после простоя.
 
-GPU на сервере (nv-02) одна на всех, а vLLM с DeepSeek-OCR держит ~10 ГБ видеопамяти постоянно,
-пока запущен. Поэтому npa-ocr ходит в vLLM только через этот шлюз (VLLM_URL=http://<шлюз>/v1):
+vLLM с DeepSeek-OCR занимает около 10 ГБ видеопамяти всё время, пока запущен.
+Если GPU общая, npa-ocr обращается к vLLM через этот шлюз
+(``VLLM_URL=http://<шлюз>/v1``):
 
-- запрос пришёл, а контейнер vLLM остановлен — шлюз запускает его (Docker API через сокет),
-  ждёт /health (холодный старт ~2–3 мин) и только потом передаёт запрос; одновременные запросы
-  ждут один и тот же старт;
-- не запустился (не хватило памяти GPU, контейнер упал, истекло VLM_START_TIMEOUT) — 503, и
-  npa-ocr берёт таблицы прежним путём (TATR), см. ocr_document;
-- VLM_IDLE_MIN минут (по умолчанию 10) без запросов и ни одного запроса в работе — контейнер
-  останавливается. Не сразу после документа: следующая работа может прийти через минуту.
+- Если контейнер vLLM остановлен, шлюз запускает его через Docker API, ждёт
+  ``/health`` (холодный старт — 2–3 мин) и затем передаёт запрос. Одновременные
+  запросы ждут один и тот же старт.
+- Если vLLM не запустился (не хватило видеопамяти, контейнер упал, истёк
+  ``VLM_START_TIMEOUT``), шлюз отвечает 503, и npa-ocr распознаёт таблицы
+  запасным путём (TATR).
+- После ``VLM_IDLE_MIN`` минут без запросов (по умолчанию 10) контейнер
+  останавливается.
 
-Контейнер останавливается, а не удаляется: при следующем старте vLLM берёт свой кэш компиляции.
-Только стандартная библиотека — запускается из того же образа npa-ocr:
+Контейнер останавливается, а не удаляется, чтобы vLLM при следующем старте
+использовал свой кэш компиляции. Модуль использует только стандартную
+библиотеку и запускается из образа npa-ocr::
 
-    python -m npa_ocr.vlm_gate      (нужен том /var/run/docker.sock)
+    python -m npa_ocr.vlm_gate      # нужен том /var/run/docker.sock
 
-Переменные: VLM_CONTAINER (имя контейнера vLLM), VLM_UPSTREAM (его адрес внутри сети),
-VLM_IDLE_MIN, VLM_START_TIMEOUT (с), VLM_GATE_PORT.
+Переменные окружения:
+    VLM_CONTAINER: Имя контейнера vLLM.
+    VLM_UPSTREAM: Адрес vLLM внутри сети Docker.
+    VLM_IDLE_MIN: Простой до остановки, мин.
+    VLM_START_TIMEOUT: Наибольшее время старта, с.
+    VLM_GATE_PORT: Порт шлюза.
+    DOCKER_SOCKET: Путь к сокету Docker.
 """
 
 from __future__ import annotations
@@ -39,15 +47,18 @@ IDLE_SECONDS = float(os.environ.get("VLM_IDLE_MIN", "10")) * 60
 START_TIMEOUT = float(os.environ.get("VLM_START_TIMEOUT", "600"))
 PORT = int(os.environ.get("VLM_GATE_PORT", "8000"))
 DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
-# генерация страницы — до ~1 мин; запас на очередь из нескольких страниц
+# распознавание страницы — до минуты; запас на очередь из нескольких страниц
 REQUEST_TIMEOUT = 900.0
 
 
 def _log(msg: str) -> None:
+    """Пишет сообщение со временем в stderr."""
     print(f"{time.strftime('%H:%M:%S')} {msg}", file=sys.stderr, flush=True)
 
 
 class _UnixConnection(http.client.HTTPConnection):
+    """HTTP-соединение через Unix-сокет."""
+
     def __init__(self, path: str, timeout: float = 30.0) -> None:
         super().__init__("localhost", timeout=timeout)
         self._path = path
@@ -65,6 +76,7 @@ class Docker:
         self.socket_path = socket_path
 
     def _call(self, method: str, path: str, timeout: float = 30.0) -> tuple[int, bytes]:
+        """Выполняет запрос к Docker API и возвращает код и тело ответа."""
         conn = _UnixConnection(self.socket_path, timeout=timeout)
         try:
             conn.request(method, path)
@@ -74,21 +86,45 @@ class Docker:
             conn.close()
 
     def state(self, name: str) -> dict:
+        """Возвращает раздел ``State`` контейнера.
+
+        Raises:
+            RuntimeError: Контейнер не найден.
+        """
         status, body = self._call("GET", f"/containers/{name}/json")
         if status != 200:
             raise RuntimeError(f"контейнер {name} не найден (Docker API {status})")
         return json.loads(body)["State"]
 
     def start(self, name: str) -> None:
+        """Запускает контейнер; уже запущенный не считается ошибкой.
+
+        Raises:
+            RuntimeError: Docker не смог запустить контейнер.
+        """
         status, body = self._call("POST", f"/containers/{name}/start")
         if status not in (204, 304):  # 304 — уже запущен
             raise RuntimeError(f"не удалось запустить {name}: {status} {body[:200]!r}")
 
     def stop(self, name: str) -> None:
+        """Останавливает контейнер с таймаутом 30 с."""
         self._call("POST", f"/containers/{name}/stop?t=30", timeout=60.0)
 
 
 class Gate:
+    """Запуск vLLM по требованию и остановка после простоя.
+
+    Args:
+        docker: Клиент Docker API.
+        container: Имя контейнера vLLM.
+        upstream: Адрес vLLM.
+        idle_seconds: Простой до остановки, с.
+        start_timeout: Наибольшее время старта, с.
+        health_fn: Проверка готовности vLLM; по умолчанию запрос ``/health``.
+        clock: Источник монотонного времени.
+        sleep: Функция ожидания.
+    """
+
     def __init__(self, docker: Docker, container: str = CONTAINER, upstream: str = UPSTREAM,
                  idle_seconds: float = IDLE_SECONDS, start_timeout: float = START_TIMEOUT,
                  health_fn=None, clock=time.monotonic, sleep=time.sleep) -> None:
@@ -106,6 +142,7 @@ class Gate:
         self.last_activity = clock()
 
     def _health(self) -> bool:
+        """Проверяет, что vLLM отвечает на ``/health``."""
         try:
             with urllib.request.urlopen(f"{self.upstream}/health", timeout=5) as resp:
                 return resp.status == 200
@@ -113,7 +150,14 @@ class Gate:
             return False
 
     def ensure_up(self) -> None:
-        """vLLM запущен и отвечает; иначе RuntimeError с причиной."""
+        """Запускает vLLM, если нужно, и ждёт готовности.
+
+        Одновременные вызовы ждут один и тот же запуск.
+
+        Raises:
+            RuntimeError: Контейнер остановился при старте или не ответил за
+                ``start_timeout``.
+        """
         if self.health_fn():
             return
         with self.start_lock:
@@ -136,17 +180,23 @@ class Gate:
             raise RuntimeError(f"{self.container} не ответил за {self.start_timeout:.0f} с")
 
     def begin(self) -> None:
+        """Отмечает начало запроса."""
         with self.lock:
             self.in_flight += 1
             self.last_activity = self.clock()
 
     def end(self) -> None:
+        """Отмечает конец запроса."""
         with self.lock:
             self.in_flight -= 1
             self.last_activity = self.clock()
 
     def idle_check(self) -> bool:
-        """Остановить vLLM, если простаивает; True — остановлен этим вызовом."""
+        """Останавливает vLLM, если он простаивает.
+
+        Returns:
+            True, если контейнер остановлен этим вызовом.
+        """
         with self.lock:
             idle = self.in_flight == 0 and self.clock() - self.last_activity >= self.idle_seconds
         if not idle:
@@ -166,10 +216,15 @@ class Gate:
 
 
 def _handler(gate: Gate):
+    """Создаёт класс обработчика HTTP, передающего запросы в vLLM через ``gate``."""
+
     class Handler(BaseHTTPRequestHandler):
+        """Передаёт запросы GET и POST в vLLM; ``/gate/health`` отвечает сам шлюз."""
+
         protocol_version = "HTTP/1.1"
 
         def _send(self, status: int, body: bytes, content_type: str = "application/json") -> None:
+            """Отправляет ответ с телом."""
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
@@ -177,6 +232,7 @@ def _handler(gate: Gate):
             self.wfile.write(body)
 
         def _proxy(self, method: str) -> None:
+            """Передаёт запрос в vLLM, при необходимости запустив его."""
             if self.path == "/gate/health":  # сам шлюз; vLLM при этом не будится
                 self._send(200, json.dumps({"ok": True}).encode())
                 return
@@ -214,10 +270,12 @@ def _handler(gate: Gate):
 
 
 def main() -> None:
+    """Запускает шлюз и фоновую проверку простоя."""
     gate = Gate(Docker())
     _log(f"шлюз vLLM: {gate.container} ({gate.upstream}), остановка после {gate.idle_seconds / 60:.0f} мин простоя")
 
     def watch() -> None:
+        """Раз в 30 с проверяет простой vLLM."""
         while True:
             time.sleep(30)
             try:

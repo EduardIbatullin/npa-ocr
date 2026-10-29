@@ -1,11 +1,8 @@
-"""CLI: `npa-ocr <pdf> [опции]` — один скан в DOCX.
+"""Командная строка: ``npa-ocr <pdf> [опции]`` распознаёт один скан в DOCX.
 
-Выделено из npa-pipeline (2026-10-12) в отдельный проект, чтобы OCR можно было
-использовать в связке с другими проектами, а не только с загрузчиком НПА. Внешний
-контракт (аргументы, JSON в stdout, строки прогресса и тайминги в stderr) не
-менялся — см. docs/plan.md. Другим проектам, которым нужно встроить OCR как
-фоновое задание (с опросом прогресса), читать этот контракт напрямую необязательно
-— см. HTTP API (README, npa_ocr.server), которое делает то же самое поверх сети.
+Контракт: аргументы командной строки, итог в JSON в stdout, строки хода
+распознавания и тайминги в stderr. Для фонового распознавания с опросом хода
+удобнее HTTP API (:mod:`npa_ocr.server`), который запускает эту же команду.
 """
 
 from __future__ import annotations
@@ -25,6 +22,7 @@ from npa_ocr.ocr import (
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Создаёт разборщик аргументов ``npa-ocr``."""
     parser = argparse.ArgumentParser(
         prog="npa-ocr",
         description="Распознать скан без текстового слоя (OCR) и собрать DOCX",
@@ -89,6 +87,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_ocr(args: argparse.Namespace) -> int:
+    """Распознаёт PDF и печатает итог в JSON.
+
+    Args:
+        args: Разобранные аргументы командной строки.
+
+    Returns:
+        Код выхода: 0 — готово, 1 — не хватило свободной памяти.
+    """
     out_path = Path(args.out) if args.out else Path(args.pdf).with_suffix(".docx")
     try:
         result = ocr_document(
@@ -123,6 +129,7 @@ def cmd_ocr(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Точка входа ``npa-ocr``."""
     parser = build_parser()
     args = parser.parse_args(argv)
     sys.exit(cmd_ocr(args))
