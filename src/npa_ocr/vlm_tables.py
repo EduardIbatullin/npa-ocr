@@ -271,6 +271,7 @@ class _Cell:
     rot: int = 0            # поворот, при котором Tesseract прочёл вертикальный текст
     literal: str | None = None  # однозначный короткий знак по геометрии изображения
     expected: str = ""      # тип графы из её заголовка
+    number_rotation: bool = False  # подтверждён несколькими изображениями цифр
 
 
 def _line_masks(gray):
@@ -526,7 +527,9 @@ def _set_column_types(cells: list[_Cell]) -> None:
         elif "п/п" in text or text.strip() == "№":
             kind = "index"
         elif ("класс опасности" in text or "количество" in text or "величина" in text
-              or "освещенность, лк" in text or "освещённость, лк" in text):
+              or "освещенность, лк" in text or "освещённость, лк" in text
+              or (c.r<=3 and any(re.match(r'\s*пд[ку]\b',v.lower())
+                                for v in (c.tess,cell_text(c.text))))):
             kind = "number"
         if kind:
             types[c.c] = kind
@@ -545,7 +548,7 @@ def _set_column_types(cells: list[_Cell]) -> None:
         if len(values) < 2:
             continue
         codes = sum(bool(ROMAN_CODE.fullmatch(v)) or doubtful_roman_code(v) for v in values)
-        numbers = sum(bool(re.fullmatch(r"[\d.,*\s–—−-]+", v)) for v in values)
+        numbers = sum(bool(re.fullmatch(r"[\d.,*\s≤≥<>=–—−-]+", v)) for v in values)
         if codes >= max(3, .6 * len(values)):
             types[col] = "code"
         elif numbers >= max(2, .8 * len(values)):
@@ -929,7 +932,7 @@ def _doubt(cells: list[_Cell]) -> list[dict]:
             numbering=(c.r<=2 and len(numbered)>=3 and all(value-col==1 for col,value in numbered))
             out.append({"r": c.r, "c": c.c, "box": [c.x0, c.y0, c.x1, c.y1], "rot": c.rot, "tess": c.tess,
                         "left": left_of(c), "kind": kind, "ds": cell_text(c.text) if kind in ("mismatch", "formula", "chemical_name", "section") else "",
-                        "expected": c.expected,"numbering":numbering})
+                        "expected": c.expected,"numbering":numbering,"number_rotation":c.number_rotation})
     return out
 
 

@@ -8,6 +8,21 @@ from npa_ocr.vlm_tables import _Cell, _doubt_kind, apply_reread, cell_text, html
 from npa_ocr.response_validation import UNREADABLE
 
 
+@pytest.mark.parametrize('value',['≤ 50','≥ 1','< 0,1','> 2','<= 50'])
+def test_numeric_schema_accepts_comparison_operators(value):
+    from npa_ocr.response_validation import matches_cell_type
+    assert matches_cell_type(value,'number')
+    assert accept(value,{'tess':value,'expected':'number'},lp=0)==value
+
+
+def test_concentration_header_sets_numeric_type_even_when_rotated_reading_is_garbage():
+    from npa_ocr.vlm_tables import _set_column_types
+    cells=[_Cell(0,0,100,30,r=0,c=3,text='ПДК, мг/м³'),
+           _Cell(0,30,100,200,r=1,c=3,text='> Ка) УМ',tess='> Ка) УМ',rot=90)]
+    _set_column_types(cells)
+    assert cells[1].expected=='number'
+
+
 @pytest.mark.parametrize("text", [
     '{ "Line": { "line_type": ["-"], "line_endpoint": ["I: (8, 0)"] } }',
     "I'm sorry, but the image provided is a graphic design and not a data chart.",

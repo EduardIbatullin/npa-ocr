@@ -30,12 +30,15 @@ def test_missing_definitions_need_agreement_and_existing_neighbours():
 
 def test_table_text_is_deduplicated_only_inside_its_source_geometry():
     text = "II. Участок приемки сырья, готовой продукции"
-    table = TableBlock(100, (10,100,900,400), [TableCell(0,0,1,2,text)], 1,2)
+    table = TableBlock(100, (10,100,900,400), [TableCell(0,0,1,2,text)], 1,2,column_edges=[0,.5,1])
     inside = TextBlock(110,text,20,850,20)
     outside = TextBlock(420,text,20,850,20)
     p = PageResult(1,True,blocks=[table,inside,outside],page_height=1000)
     assert remove_table_duplicates(p).blocks == [table,outside]
     assert p.blocks == [table,inside,outside]
+    from dataclasses import replace
+    unruled=replace(table,column_edges=[])
+    assert remove_table_duplicates(replace(p,blocks=[unruled,inside])).blocks==[unruled,inside]
 
 
 def test_subset_grid_is_continuation_and_scan_drift_does_not_add_column():
@@ -89,6 +92,8 @@ def test_upright_quantity_cannot_be_rotated_into_a_dash(monkeypatch):
         return '1','stop',0
     result=_try_cell(ask,image,dict(box=[0,0,100,100],tess='',kind='empty',expected='number'))
     assert result['rot']==0 and result['used']=='1' and len(calls)==1
+    unconfirmed=_try_cell(ask,image,dict(box=[0,0,100,100],tess='Ка',kind='schema',expected='number',rot=90))
+    assert unconfirmed['rot']==0 and unconfirmed['used']=='1'
     header=_try_cell(ask,image,dict(box=[0,0,100,100],tess='',kind='empty',expected='number',numbering=True))
     assert header['used']=='1' and abs(header['rot'])==90
 
@@ -141,11 +146,12 @@ def test_inline_chapter_number_is_read_from_image_not_globally_replaced():
 def test_review_report_preserves_unreadable_output_and_does_not_claim_verification():
     from npa_ocr.coverage import review_report
     block=TableBlock(100,(0,100,500,200),[TableCell(0,0,1,1,'[не распознано]')],1,1,source_pages=[3])
-    pages=[PageResult(3,True,blocks=[block,TextBlock(20,'сомнительное слово',low_words=(True,False))])]
+    pages=[PageResult(3,True,blocks=[block,TextBlock(20,'сомнительное слово',low_words=(True,False)),
+                                  TextBlock(30,'[не распознано]')])]
     result=review_report(pages)
     assert result['result_policy']=='automatic_only'
     assert result['complete_transcription_verified'] is False
-    assert result['summary']==dict(flagged_fragments=2,unreadable_fragments=1)
+    assert result['summary']==dict(flagged_fragments=3,unreadable_fragments=2)
     assert result['items'][0]['reason']=='unreadable_cell'
     assert result['items'][0]['source_pages']==[3]
     assert block.cells[0].text=='[не распознано]'

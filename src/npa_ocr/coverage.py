@@ -55,7 +55,7 @@ def remove_table_duplicates(page):
     from dataclasses import replace
     from npa_ocr.ocr import TextBlock, TableBlock
 
-    tables = [b for b in page.blocks if isinstance(b, TableBlock)]
+    tables = [b for b in page.blocks if isinstance(b, TableBlock) and b.column_edges]
     def duplicate(block):
         if not isinstance(block, TextBlock):
             return False
@@ -135,8 +135,9 @@ def review_items(pages) -> list[dict]:
                         out.append(dict(page=page.page_number,source_pages=block.source_pages,block=bi,
                                         row=c.row,col=c.col,text=c.text,
                                         reason='unreadable_cell' if '[не распознано]' in c.text else 'flagged_cell'))
-            elif isinstance(block,TextBlock) and any(block.low_words):
-                out.append(dict(page=page.page_number,block=bi,text=block.text,reason='flagged_text'))
+            elif isinstance(block,TextBlock) and (any(block.low_words) or '[не распознано]' in block.text):
+                out.append(dict(page=page.page_number,block=bi,text=block.text,
+                                reason='unreadable_text' if '[не распознано]' in block.text else 'flagged_text'))
     return out
 
 

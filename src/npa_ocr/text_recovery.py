@@ -86,5 +86,10 @@ def recover_titles(lines: list[list[Word]], raw: str | None, image: Image.Image)
             replacement.setdefault(key, []).append(Word(str(text).strip(), float(data["conf"][i]),
                 (x0 + x, y0 + y, x0 + x + width, y0 + y + height), restored=True))
         result = [[w for w in line if not inside(w)] for line in result]
-        result = [line for line in result if line] + list(replacement.values())
+        # A newly read Russian heading may turn II into П again. Apply the
+        # same image-supported technical-token alignment used by the main
+        # text pass, instead of undoing it during title recovery.
+        from npa_ocr.vlm_text import reread_lines
+        recovered,_=reread_lines(list(replacement.values()),raw,image.width,image.height)
+        result = [line for line in result if line] + recovered
     return sorted(result, key=lambda line: min(w.box[1] for w in line))

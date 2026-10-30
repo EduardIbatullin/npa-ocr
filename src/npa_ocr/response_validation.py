@@ -38,7 +38,7 @@ def matches_cell_type(text: str, expected: str) -> bool:
     if expected == "number":
         if re.fullmatch(r"\d+(?:[.,]\d+)?(?:\.{2,}|…)",text):
             return False
-        return bool(re.match(r"^(?:(?:не более|не менее|до)\s+)?[+−–—-]?\d", text, re.I))
+        return bool(re.match(r"^(?:(?:не более|не менее|до)\s+)?(?:[≤≥<>]=?\s*)?[+−–—-]?\d", text, re.I))
     if expected == "index":
         return bool(re.fullmatch(r"\d{1,4}[.)]?", text))
     if expected == "cas":

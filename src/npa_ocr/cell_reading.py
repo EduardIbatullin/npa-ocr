@@ -292,4 +292,5 @@ def orient_numbering(image: Image.Image, cells) -> None:
         for c in cells:
             if c.c==col and c.cs==1:
                 c.rot=angle
+                c.number_rotation=True
                 c.literal=None
