@@ -39,6 +39,7 @@ from typing import Callable
 from PIL import Image, ImageOps
 
 from npa_ocr.vlm_tables import VLLM_MODEL, VLLM_URL, VlmUnavailable, norm
+from npa_ocr.response_validation import is_service_response
 
 PAD = 4        # отступ внутрь ячейки — линии рамки в кроп не берём
 BORDER = 24    # белое поле вокруг кропа
@@ -105,6 +106,12 @@ def clean(text: str) -> str:
     Убирает служебные токены и теги, переводит индексы в подстрочные цифры
     («H_2SO_4» → «H₂SO₄»), степени — в надстрочные, ``\\le`` — в «≤».
     """
+    if is_service_response(text):
+        return ""
+    text = re.sub(r"\\{2,}(?=[()[\]])", lambda m: "\\", text)
+    # Обёртки LaTeX не являются частью химической формулы.
+    text = re.sub(r"\\(?:mathrm|text|operatorname|underline|boxed)\{([^{}]*)\}",
+                  lambda m: "№" if m[1].strip() == "No" else m[1], text)
     text = re.sub(r"<sup>\s*([23])\s*</sup>", _sup, text)
     text = re.sub(r"<\|[^|]*\|>", " ", text)
     text = re.sub(r"<[^>]+>", " ", text)          # обёртка таблицы/разметки, если модель её добавила
@@ -114,7 +121,7 @@ def clean(text: str) -> str:
     text = re.sub(r"_\{?(\d+)\}?", lambda m: m[1].translate(_TO_SUB), text)
     text = re.sub(r"\\[\[\]()]", " ", text).replace("\\leq", "≤").replace("\\le", "≤").replace("$", "")
     text = re.sub(r"\s*\^\{?([23])\}?", _sup, text)
-    text = " ".join(text.split()).strip("- ")
+    text = " ".join(text.split()).strip()
     return re.sub(r"\(\s+", "(", re.sub(r"\s+([),.;])", r"\1", text))  # пробелы от вырезанной разметки
 
 
@@ -142,11 +149,30 @@ def accept(text: str, d: dict, lp: float = -1.0) -> str | None:
     Returns:
         Принятый текст (латинские двойники заменены кириллицей) или None.
     """
-    if not text or "\\" in text or "^" in text or re.search(r"\[[A-Za-z+0-9.-]+\]", text):
+    if not text or is_service_response(text) or "\\" in text or "^" in text or re.search(r"\[[A-Za-z+0-9.-]+\]", text):
         return None
     if re.search(r"[Ͱ-Ͽ]", text):  # греческие буквы — модель читает кириллицу как формулу
         return None
     tess = d["tess"]
+    if d.get('numbering') and not re.fullmatch(r'\d{1,2}',text):
+        return None
+    from npa_ocr.scientific_text import ROMAN_CODE
+    from npa_ocr.response_validation import matches_cell_type
+
+    if not matches_cell_type(text, d.get("expected", "")):
+        return None
+    if d.get("expected") == "formula":
+        return text
+
+    # Римская часть и кириллическая буква подразряда — намеренное сочетание
+    # алфавитов. Его нельзя превращать в кириллицу по большинству букв соседа.
+    if ROMAN_CODE.fullmatch(text):
+        return text
+    if d.get("kind") == "code":
+        return None
+    # Короткая числовая ячейка не может содержать текст соседнего столбца.
+    if re.fullmatch(r"[\d.,≤≥<>+−–—\-\s*]+", tess.strip()) and re.search(r"[А-Яа-яA-Za-z]", text):
+        return None
     if len(_CYR.findall(tess)) > len(_LAT.findall(tess)):
         # латинские слова без цифр («no», «C») — кириллица, прочитанная латиницей; «C6-C10» не трогаем
         text = " ".join(w if re.search(r"[\d₀-₉]", w) else w.translate(_TO_CYR) for w in text.split())
@@ -204,10 +230,10 @@ def _keep_ds(got: str | None, lp: float, d: dict) -> str | None:
 # --- Кропы ---
 
 
-def _part(crop: Image.Image, box: list[int]) -> Image.Image:
+def _part(crop: Image.Image, box: list[int], pad: int = PAD) -> Image.Image:
     """Фрагмент ячейки без линий рамки, в оттенках серого."""
     x0, y0, x1, y1 = box
-    return crop.crop((x0 + PAD, y0 + PAD, x1 - PAD, y1 - PAD)).convert("L")
+    return crop.crop((x0 + pad, y0 + pad, x1 - pad, y1 - pad)).convert("L")
 
 
 def cell_image(crop: Image.Image, d: dict, rot: int = 0) -> Image.Image:
@@ -222,6 +248,9 @@ def cell_image(crop: Image.Image, d: dict, rot: int = 0) -> Image.Image:
         Повёрнутая и при необходимости увеличенная ячейка с белым полем.
     """
     part = _part(crop, d["box"])
+    if d.get('expected')=='number' and not rot and not d.get('rot'):
+        from npa_ocr.stroke_geometry import remove_broken_side_rule
+        part=remove_broken_side_rule(part).convert('L')
     if rot:
         part = part.rotate(rot, expand=True, fillcolor=255)
     if part.height < MIN_H:
@@ -288,10 +317,13 @@ def _try_cell(ask: AskFn, crop: Image.Image, d: dict) -> dict:
         got = _keep_ds(accept(text, d, lp) if reason != "length" else None, lp, d)
         return {"vlm": text, "lp": lp, "rot": rot, "used": got}
 
-    if is_vertical(_part(crop, d["box"])):
+    # An upright digit 1 is itself a tall component, not vertical writing.
+    # Rotating it turns a quantity into a highly confident dash.
+    short_value = d.get("expected") in ("number", "index", "code", "cas") and not d.get('numbering')
+    if d.get("rot") or (not short_value and is_vertical(_part(crop, d["box"]))):
         return max((read(90), read(-90)), key=lambda c: c["lp"])
     res = read(0)
-    if res["used"] is None and not d["tess"]:
+    if res["used"] is None and (not d["tess"] or d.get('numbering')) and not short_value:
         res = max((res, read(90), read(-90)), key=lambda c: (c["used"] is not None, c["lp"]))
     return res
 
@@ -317,6 +349,115 @@ def _try_cell_md(ask: AskFn, crop: Image.Image, d: dict) -> dict:
 ATTEMPTS = (("cell", _try_cell), ("pair", _try_pair), ("cell_md", _try_cell_md))
 
 
+def _verify_scientific(ask: AskFn, crop: Image.Image, d: dict) -> str | None:
+    """Сверяет химическую ячейку по двум увеличенным чтениям самого скана.
+
+    Синтаксически допустимые Cr/Hs/Hg и N20 тоже могут быть ошибками OCR.
+    Состав не выводится из названия или CAS. Различающиеся ответы оставляют
+    исходный вариант сомнительным; обычные попытки его не перезаписывают.
+    """
+    from npa_ocr.scientific_text import chemical_indices, is_chemical_formula
+
+    # Рамки сетки уже находятся внутри линий. Дополнительные 4 px в узкой
+    # химической графе срезали низ индекса 2, превращая его в 7 или букву.
+    source = _part(crop, d["box"], pad=1)
+    if source.width <= 0 or source.height <= 0:
+        return None
+    if d["expected"] == "formula":
+        from npa_ocr.formula_geometry import formula_consensus
+        evidence = formula_consensus(source, _part(crop, d["box"]))
+        previous = chemical_indices(d.get("ds", ""))
+        if evidence is not None:
+            geometric, repaired = evidence
+            if repaired or geometric == previous or not is_chemical_formula(previous):
+                return geometric
+    def read(scale: int, prompt: str) -> str | None:
+        part = source.resize((source.width * scale, source.height * scale), Image.LANCZOS)
+        part = ImageOps.expand(part, BORDER, fill=255).convert("RGB")
+        raw, reason, lp = ask(part, prompt)
+        if reason == "length" or lp < -.6 or "<smiles>" in raw.lower():
+            return None
+        text = clean(raw)
+        if d["expected"] == "formula":
+            text = chemical_indices(text)
+            if not is_chemical_formula(text):
+                return None
+        else:
+            text = re.sub(r"(?<=-)\s+", "", text)
+            if (len(_CYR.findall(text)) < 3 or re.search(r"[A-Za-z]{4,}", text)
+                    or "\\" in text or not text):
+                return None
+            old = d.get("ds") or d.get("tess", "")
+            if any(text.count(mark) != old.count(mark) for mark in ("+", "*")):
+                return None
+            if re.findall(r"\d+", text) != re.findall(r"\d+", old):
+                return None
+            if SequenceMatcher(None, old.casefold(), text.casefold()).ratio() < .75:
+                return None
+        return text
+    prompts = ["Free OCR."]
+    if d["expected"] == "formula":
+        prompts.append("Convert the document to markdown.")
+    candidate = None
+    for prompt in prompts:
+        first = read(2, prompt)
+        if first is None:
+            continue
+        second = read(3, prompt)
+        if second is None:
+            continue
+        if first != second:
+            return None
+        candidate = first
+        break
+    if candidate is None:
+        return None
+    if d["expected"] == "formula" and d.get("ds") and candidate != chemical_indices(d["ds"]):
+        from npa_ocr.formula_geometry import read_formula
+        local = read_formula(source, 4)
+        if local is not None and local[0] == chemical_indices(d["ds"]):
+            return None
+    if d["expected"] == "chemical_name":
+        def lexical(value):
+            # Совпадающее чтение самой N достаточно для исправления
+            # локантов. Изменение русских корней требует независимого OCR.
+            value = re.sub(r"(?:М№?|M№?|№)[’']?(?=-)", "N", value)
+            return re.sub(r"\s+", "", value).casefold()
+        old = d.get("ds") or d.get("tess", "")
+        if candidate.endswith('.') and not old.endswith('.'):
+            candidate = candidate[:-1]
+        if lexical(candidate) != lexical(old):
+            import pytesseract
+            part = source.resize((source.width * 4, source.height * 4), Image.LANCZOS)
+            local = pytesseract.image_to_string(ImageOps.expand(part, BORDER, fill=255), lang="rus+eng", config="--psm 6")
+            old_score = SequenceMatcher(None, lexical(old), lexical(local)).ratio()
+            new_score = SequenceMatcher(None, lexical(candidate), lexical(local)).ratio()
+            if new_score <= old_score:
+                return None
+    return candidate
+
+
+def _verify_section(ask: AskFn, crop: Image.Image, d: dict) -> str | None:
+    """Section labels need whole-title agreement, not a guessed Roman prefix."""
+    from npa_ocr.scientific_text import section_heading
+    part=cell_image(crop,d)
+    answers=[]
+    for image in (part,ImageOps.expand(part.resize((part.width*3//2,part.height*3//2)),16,'white')):
+        raw,reason,lp=ask(image,'Free OCR.')
+        if reason=='length' or lp<-.6 or is_service_response(raw):
+            return None
+        title=section_heading(clean(raw).strip().rstrip(' |-=—–'))
+        if not title:
+            return None
+        answers.append(' '.join(title.split()))
+    if answers[0]!=answers[1]:
+        return None
+    # The name must still correspond to the original cell, even if its prefix
+    # was completely broken. Do not replace a heading with a neighbouring one.
+    old=d.get('ds') or d.get('tess','')
+    return answers[0] if _sim(answers[0],old)>=.7 else None
+
+
 def reread_cells(crop: Image.Image, doubt: list[dict], ask: AskFn = deepseek_ask) -> dict[tuple[int, int], str]:
     """Повторно читает сомнительные ячейки таблицы.
 
@@ -332,7 +473,19 @@ def reread_cells(crop: Image.Image, doubt: list[dict], ask: AskFn = deepseek_ask
         VlmUnavailable: vLLM недоступен.
     """
     results: list[dict] = [{"used": None} for _ in doubt]
-    todo = list(range(len(doubt)))
+    sections=[i for i,d in enumerate(doubt) if d.get('expected')=='section']
+    if sections:
+        with ThreadPoolExecutor(WORKERS) as ex:
+            answers=list(ex.map(lambda i:_verify_section(ask,crop,doubt[i]),sections))
+        for i,text in zip(sections,answers):
+            results[i]={'used':text}
+    scientific = [i for i, d in enumerate(doubt) if d.get("expected") in ("formula", "chemical_name")]
+    if scientific:
+        with ThreadPoolExecutor(WORKERS) as ex:
+            answers = list(ex.map(lambda i: _verify_scientific(ask, crop, doubt[i]), scientific))
+        for i, text in zip(scientific, answers):
+            results[i] = {"used": text}
+    todo = [i for i in range(len(doubt)) if i not in scientific and i not in sections]
     for _name, attempt in ATTEMPTS:
         if not todo:
             break

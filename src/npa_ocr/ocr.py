@@ -118,6 +118,8 @@ class TableBlock:
     n_rows: int
     n_cols: int
     dropped_columns: int = 0  # столбцы без текста, удалённые как артефакт структуры (TATR)
+    column_edges: list[float] = field(default_factory=list)
+    source_pages: list[int] = field(default_factory=list)
 
 
 PageBlock = TextBlock | TableBlock | FormulaBlock
@@ -1274,8 +1276,8 @@ def run_vlm_table_blocks(
 ) -> list[TableBlock]:
     """Распознаёт таблицы страницы через DeepSeek-OCR и сетку по линиям.
 
-    Ячейки с текстом только от Tesseract или поставленным по положению
-    помечаются как неуверенные, если повторное чтение их не подтвердило.
+    Ячейки с текстом только от Tesseract, поставленным по положению или
+    исправленным повторным чтением выделяются для сверки со сканом.
 
     Args:
         image_path: Изображение страницы.
@@ -1321,11 +1323,19 @@ def run_vlm_table_blocks(
             timer.add(page, "таблицы: дочитка ячеек (vLLM)", reread_seconds[0])
     return [
         TableBlock(
-            y=float(t.bbox[1]),
-            bbox=(float(t.bbox[0]), float(t.bbox[1]), float(t.bbox[2]), float(t.bbox[3])),
+            y=float(t.bbox[1] + t.info["ye"][0]) if t.src == "grid" and t.info.get("ye") else float(t.bbox[1]),
+            # Поле вокруг кропа нужно OCR, но не принадлежит таблице.
+            # Исключение этого поля из обычного текста съедало последнюю
+            # строку заголовков, расположенных вплотную к верхней рамке.
+            bbox=(float(t.bbox[0] + t.info["xe"][0]), float(t.bbox[1] + t.info["ye"][0]),
+                  float(t.bbox[0] + t.info["xe"][-1]), float(t.bbox[1] + t.info["ye"][-1]))
+                 if t.src == "grid" and t.info.get("xe") and t.info.get("ye") else tuple(map(float, t.bbox)),
             cells=t.cells,
             n_rows=t.n_rows,
             n_cols=t.n_cols,
+            column_edges=[(x - t.info["xe"][0]) / max(1, t.info["xe"][-1] - t.info["xe"][0])
+                          for x in t.info.get("xe", [])] if t.src == "grid" else [],
+            source_pages=[page] if page is not None else [],
         )
         for t in tables
         if t.cells
@@ -1382,6 +1392,11 @@ def ocr_page(
         clean_marks_fn=clean_marks_fn,
         reread_text_fn=reread_text_fn,
     )
+    if tables and table_blocks_fn is not None:
+        from npa_ocr.coverage import absorb_ruled_notes, recover_table_closers
+        with Image.open(image_path) as source_image:
+            tables, text_blocks = absorb_ruled_notes(source_image, tables, text_blocks)
+            text_blocks = recover_table_closers(source_image, tables, text_blocks)
     blocks: list[PageBlock] = [*tables, *text_blocks]
     blocks.sort(key=lambda b: b.y)
     return blocks
@@ -1390,7 +1405,7 @@ def ocr_page(
 # --- Сборка DOCX ---
 
 
-def _add_table(doc, block: TableBlock) -> None:
+def _add_table(doc, block: TableBlock, *, diagnostic: bool = False) -> None:
     """Добавляет таблицу в документ с объединением ячеек.
 
     Объединения разных ячеек могут конфликтовать и давать непрямоугольную
@@ -1401,8 +1416,24 @@ def _add_table(doc, block: TableBlock) -> None:
     from docx.enum.text import WD_COLOR_INDEX
     from docx.exceptions import InvalidSpanError
 
+    if diagnostic and block.source_pages:
+        pages = ", ".join(map(str, block.source_pages))
+        doc.add_paragraph(f"Источник: PDF, страницы {pages}.", style="Caption")
     table = doc.add_table(rows=block.n_rows, cols=block.n_cols)
     table.style = "Table Grid"
+    if len(block.column_edges) == block.n_cols + 1:
+        # Продолжения могут иметь дополнительные границы объединений.
+        # Их узкие промежутки сохраняют ширину скана, а не получают
+        # одинаковую ширину с полноценными графами.
+        section = doc.sections[-1]
+        available = int(section.page_width - section.left_margin - section.right_margin)
+        widths = [int(available * (right - left))
+                  for left, right in zip(block.column_edges, block.column_edges[1:])]
+        table.autofit = False
+        for column, width in zip(table.columns, widths):
+            column.width = width
+        for i, target in enumerate(table._cells):
+            target.width = widths[i % block.n_cols]
     merged: set[tuple[int, int]] = set()
     for cell in block.cells:
         if (cell.row, cell.col) in merged:
@@ -1432,6 +1463,8 @@ def _add_table(doc, block: TableBlock) -> None:
                     run.font.highlight_color = WD_COLOR_INDEX.YELLOW
         else:
             target.text = cell.text
+    from npa_ocr.docx_layout import format_table
+    format_table(table, block)
 
 
 _INDENT_MIN_PX = 40  # около 5 мм при 200 DPI — отступ первой строки абзаца
@@ -1486,6 +1519,20 @@ def _text_paragraphs(run: list[TextBlock], dpi: int) -> list[tuple[str, str, flo
 
     if not run:
         return []
+    # A recovered number can be a separate OCR line slightly above the
+    # date/city baseline. Rejoin this one spatially confirmed requisites row.
+    run=list(run)
+    for number in list(run):
+        if not re.fullmatch(r"№\s*\d{1,5}",number.text):
+            continue
+        date=next((b for b in run if b is not number
+                   and re.fullmatch(r"\d{2}\.\d{2}\.\d{4}\s+[А-Яа-яЁё. -]+",b.text)
+                   and b.x1<number.x0 and max(b.y,number.y)<min(b.y+b.height,number.y+number.height)),None)
+        if date is not None:
+            flags=tuple(date.low_words)+tuple(number.low_words)
+            run[run.index(date)]=replace(date,text=date.text+' '+number.text,x1=number.x1,
+                                         low_words=flags)
+            run.remove(number)
     if not all(b.x1 > b.x0 for b in run):
         return [(b.text, "left", 0.0, _paragraph_segments([b])) for b in run]
 
@@ -1513,10 +1560,20 @@ def _text_paragraphs(run: list[TextBlock], dpi: int) -> list[tuple[str, str, flo
         centered = is_centered(b)
         if prev is None:
             new_paragraph = True
-        elif centered or is_centered(prev):
+        elif re.fullmatch(r'\s*»\s*\.?\s*',b.text) or re.fullmatch(r'\s*»\s*\.?\s*',prev.text):
             new_paragraph = True
+        elif centered or is_centered(prev):
+            new_paragraph = not (centered and is_centered(prev) and line_height
+                                 and b.y - (prev.y + prev.height) <= line_height
+                                 and not re.search(r"[.!?;:]\s*$", prev.text))
         elif b.x0 - area_left > _INDENT_MIN_PX:
             new_paragraph = True
+        elif (len(b.text)>3 and len(prev.text)>3 and abs(b.x0-prev.x0)<20
+              and max(b.x1-b.x0,prev.x1-prev.x0)<.65*area_width
+              and line_height and b.y-(prev.y+prev.height)<=1.5*line_height
+              and not re.search(r"[.!?;:]\s*$",prev.text)
+              and not re.match(r"\s*\d+[.)]\s",b.text)):
+            new_paragraph = False
         elif prev.x1 < area_right - _SHORT_LINE_RATIO * area_width:
             new_paragraph = True
         elif line_height and b.y - (prev.y + prev.height) > _PARAGRAPH_GAP_RATIO * line_height:
@@ -1640,6 +1697,38 @@ def stitch_tables(pages: list[PageResult]) -> tuple[list[PageResult], list[str]]
             continue
         page = replace(page, blocks=list(page.blocks))
         result.append(page)
+        if last is not None and last[2] == page.page_number - 1 and last[3] >= _STITCH_BOTTOM_RATIO:
+            host_page, index, _, _ = last
+            host = host_page.blocks[index]
+            note = next((c for c in host.cells if c.col == 0 and c.col_span == host.n_cols
+                         and c.row + c.row_span == host.n_rows and len(c.text) > 60
+                         and re.search(r"ГОСТ|регистрацион|Примеч", c.text, re.I)), None)
+            fragments: list[TextBlock] = []
+            closed = False
+            for candidate in page.blocks:
+                if not isinstance(candidate, TextBlock) or candidate.y > .25 * page.page_height:
+                    break
+                if re.fullmatch(r'\s*[»”"]\s*\.?\s*', candidate.text):
+                    closed = bool(fragments)
+                    break
+                if not fragments and (candidate.y > .15 * page.page_height
+                                      or not candidate.text[:1].islower()):
+                    break
+                if re.match(r"\s*\d+[.)]\s", candidate.text):
+                    break
+                fragments.append(candidate)
+            if note is not None and closed:
+                original_lines = note.text.split("\n")
+                low = (note.low_lines if len(note.low_lines) == len(original_lines)
+                       else [any(note.low_lines)] * len(original_lines))
+                joined = replace(note, text=note.text + "\n" + "\n".join(b.text for b in fragments),
+                                 low_lines=list(low) + [True] * len(fragments))
+                host_page.blocks[index] = replace(host, cells=[joined if c is note else c for c in host.cells],
+                    source_pages=sorted(set(host.source_pages + [page.page_number])))
+                page.blocks = page.blocks[len(fragments):]
+                page.continues_table = True
+                log.append(f"стр. {page.page_number}: продолжение примечания возвращено в ячейку таблицы")
+                last = None
         kept: list[PageBlock] = []
         first_table = True
         for block in page.blocks:
@@ -1648,20 +1737,28 @@ def stitch_tables(pages: list[PageResult]) -> tuple[list[PageResult], list[str]]
                 continue
             top_ratio = block.bbox[1] / page.page_height
             bottom_ratio = block.bbox[3] / page.page_height
+            host = last[0].blocks[last[1]] if last is not None else None
+            aligned = (table_stitch.align_columns(host.cells, host.column_edges, block.cells, block.column_edges)
+                       if host is not None and host.column_edges and block.column_edges else None)
             if (
                 first_table
                 and last is not None
                 and last[2] == page.page_number - 1
                 and last[3] >= _STITCH_BOTTOM_RATIO
                 and top_ratio <= _STITCH_TOP_RATIO
-                and last[0].blocks[last[1]].n_cols == block.n_cols
+                and (aligned is not None or (not (host.column_edges and block.column_edges)
+                                             and host.n_cols == block.n_cols))
             ):
                 host_page, index, _, _ = last
                 host = host_page.blocks[index]
+                top_cells, cont_cells, edges = aligned if aligned is not None else (host.cells, block.cells, [])
                 cells, n_rows, done = table_stitch.merge_continuation(
-                    host.cells, host.n_rows, block.cells, block.n_rows
+                    top_cells, host.n_rows, cont_cells, block.n_rows
                 )
-                host_page.blocks[index] = replace(host, cells=cells, n_rows=n_rows)
+                host_page.blocks[index] = replace(host, cells=cells, n_rows=n_rows,
+                    n_cols=len(edges) - 1 if edges else host.n_cols,
+                    column_edges=edges or host.column_edges,
+                    source_pages=sorted(set(host.source_pages + block.source_pages)))
                 page.continues_table = True
                 log.append(
                     f"стр. {page.page_number}: продолжение таблицы со стр. {host_page.page_number} — "
@@ -1676,7 +1773,8 @@ def stitch_tables(pages: list[PageResult]) -> tuple[list[PageResult], list[str]]
     return result, log
 
 
-def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DPI) -> None:
+def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DPI,
+               diagnostic: bool = False) -> None:
     """Собирает DOCX из распознанных страниц.
 
     Страницы с текстовым слоем пишутся как есть. На страницах OCR строки
@@ -1691,9 +1789,16 @@ def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DP
     """
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
-    from docx.shared import Pt
+    from docx.shared import Pt, Cm
 
     doc = Document()
+    from npa_ocr.docx_layout import set_document_language, keep_table_titles, format_requisites
+    set_document_language(doc)
+    section = doc.sections[0]
+    section.page_width, section.page_height = Cm(21), Cm(29.7)
+    section.left_margin = section.right_margin = Cm(1)
+    section.top_margin = section.bottom_margin = Cm(1)
+    section.header_distance = section.footer_distance = Cm(.5)
     has_low_confidence = any(
         (isinstance(block, TableBlock) and any(any(cell.low_lines) for cell in block.cells))
         or (isinstance(block, TextBlock) and any(block.low_words))
@@ -1703,10 +1808,12 @@ def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DP
     )
     if has_low_confidence:
         doc.add_paragraph(
-            "Жёлтым выделено текст, распознанный с низкой уверенностью: проверьте его по скану."
+            "Жёлтым выделен неуверенно распознанный или восстановленный текст: проверьте его по скану."
         )
     for i, page in enumerate(pages):
-        if i > 0 and not page.continues_table:
+        # A source page boundary is not a layout boundary after reflow.
+        # Keep it only in diagnostic exports and for untouched text layers.
+        if i > 0 and not page.continues_table and (diagnostic or not page.ocr_applied):
             doc.add_page_break()
         if not page.ocr_applied:
             doc.add_paragraph(page.plain_text or "")
@@ -1728,6 +1835,7 @@ def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DP
                     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 elif first_line:
                     para.paragraph_format.first_line_indent = Pt(first_line)
+                format_requisites(para,section.page_width-section.left_margin-section.right_margin)
             run.clear()
 
         for block in page.blocks:
@@ -1738,8 +1846,9 @@ def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DP
                 docx_math.add_formula(doc, block.latex)
             else:
                 flush_run()
-                _add_table(doc, block)
+                _add_table(doc, block, diagnostic=diagnostic)
         flush_run()
+    keep_table_titles(doc)
     doc.save(str(out_path))
 
 
@@ -1987,6 +2096,8 @@ def _block_to_dict(block: PageBlock) -> dict:
             "n_rows": block.n_rows,
             "n_cols": block.n_cols,
             "dropped_columns": block.dropped_columns,
+            "column_edges": block.column_edges,
+            "source_pages": block.source_pages,
             "cells": [{**asdict(c), "low_lines": list(c.low_lines)} for c in block.cells],
         }
     if isinstance(block, FormulaBlock):
@@ -2013,6 +2124,8 @@ def _block_from_dict(data: dict) -> PageBlock:
             n_rows=data["n_rows"],
             n_cols=data["n_cols"],
             dropped_columns=data["dropped_columns"],
+            column_edges=data.get("column_edges", []),
+            source_pages=data.get("source_pages", []),
         )
     if data["type"] == "formula":
         return FormulaBlock(y=data["y"], latex=data["latex"], bbox=tuple(data["bbox"]))
@@ -2181,6 +2294,8 @@ def ocr_document(
     vlm_chat_fn: Callable[[Image.Image], str] | None = None,
     vlm_ask_fn: "vlm_reread.AskFn | None" = None,
     marks_ask_fn: Callable[[Image.Image], str] | None = None,
+    diagnostic: bool = False,
+    requisites_ask_fn: Callable[[Image.Image, str], str] | None = None,
 ) -> OcrDocumentResult:
     """Распознаёт PDF и собирает DOCX.
 
@@ -2256,7 +2371,7 @@ def ocr_document(
         }
         if table_engine == "vlm":
             # версия пути vlm: при её смене сохранённые страницы распознаются заново
-            meta["vlm_version"] = 3
+            meta["vlm_version"] = 11
             if use_ai_escalation:
                 # удаление меток (vlm_marks) вместо ИИ-эскалации
                 meta["marks_version"] = 1
@@ -2364,8 +2479,11 @@ def ocr_document(
                     try:
                         def chat(img: Image.Image) -> str:
                             """Запрос к DeepSeek-OCR; ответ сохраняется для меток и второго прочтения."""
-                            page_ds[_page] = vlm_chat_fn(img)
-                            return page_ds[_page]
+                            raw = vlm_chat_fn(img)
+                            # Повторный запрос по кропу таблицы имеет другую систему
+                            # координат: второе чтение текста использует только страницу.
+                            page_ds.setdefault(_page, raw)
+                            return raw
 
                         return run_vlm_table_blocks(path, chat, ask_fn=vlm_ask_fn, timer=timer, page=_page)
                     except vlm_tables.VlmUnavailable as exc:
@@ -2409,7 +2527,17 @@ def ocr_document(
                 with Image.open(path) as img:
                     width, height = img.size
                 with timer.step(_page, "текст: второе прочтение DeepSeek"):
-                    return vlm_text.reread_lines(lines, page_ds.get(_page), width, height)
+                    restored, formulas = vlm_text.reread_lines(lines, page_ds.get(_page), width, height)
+                    from npa_ocr.requisites import restore_header_number, restore_inline_requisites
+                    from npa_ocr.text_recovery import recover_titles, recover_inline_codes
+
+                    with Image.open(path) as img:
+                        restored = recover_titles(restored, page_ds.get(_page), img)
+                        restored = restore_header_number(restored, page_ds.get(_page), img, vlm_ask_fn)
+                        restored = restore_inline_requisites(restored, img, vlm_ask_fn,
+                            requisites_ask_fn or (vlm_marks.qwen_read if use_ai_escalation else None))
+                        restored = recover_inline_codes(restored, img, vlm_ask_fn)
+                    return restored, formulas
 
             use_marks = use_vlm and use_ai_escalation
             if use_tatr or use_vlm:
@@ -2454,13 +2582,18 @@ def ocr_document(
     with timer.step(None, "Колонтитулы"):
         pages = remove_running_headers_and_footers(pages)
     if table_engine == "vlm":
+        from npa_ocr.coverage import remove_table_duplicates
+        pages = [remove_table_duplicates(page) for page in pages]
         # пороги сшивки подобраны под рамки таблиц vlm_tables; у TATR рамки другие
         with timer.step(None, "Сшивка таблиц между страницами"):
             pages, stitch_log = stitch_tables(pages)
         for line in stitch_log:
             print(f"  [сшивка] {line}", file=sys.stderr, flush=True)
     with timer.step(None, "Сборка DOCX"):
-        build_docx(pages, out_docx_path, dpi=dpi)
+        build_docx(pages, out_docx_path, dpi=dpi, diagnostic=diagnostic)
+        from npa_ocr.coverage import review_report
+        out_docx_path.with_suffix(".review.json").write_text(
+            json.dumps(review_report(pages), ensure_ascii=False, indent=2), encoding="utf-8")
 
     timings = timer.report()
     timings_path = out_docx_path.with_name(out_docx_path.stem + ".timings.json")

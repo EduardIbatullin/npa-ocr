@@ -8,6 +8,37 @@ import json
 from pathlib import Path
 
 from npa_ocr.ocr import PageResult, TableBlock, TextBlock, _load_page, build_docx, stitch_tables
+
+
+def test_blank_continuation_does_not_inherit_numeric_norm():
+    from npa_ocr.table_stitch import merge_continuation
+    top = [TableCell(0, 0, 1, 1, "36", []), TableCell(0, 1, 1, 1, "15", [])]
+    cont = [TableCell(0, 0, 1, 1, "", []), TableCell(0, 1, 1, 1, "", []),
+            TableCell(1, 0, 1, 1, "37", []), TableCell(1, 1, 1, 1, "20", [])]
+    cells, rows, _ = merge_continuation(top, 1, cont, 2)
+    assert next(c for c in cells if c.text == "36").row_span == 2
+    assert next(c for c in cells if c.text == "15").row_span == 1
+    assert any(c.row == 1 and c.col == 1 and c.text == "" for c in cells)
+
+
+def test_plain_note_continuation_returns_to_merged_cell_only_with_closing_quote():
+    note = "Регистрационный номер CAS; класс опасности — пункт ГОСТ. Система стандартов"
+    table = TableBlock(y=800, bbox=(0, 800, 800, 950), n_rows=1, n_cols=2,
+                       cells=[TableCell(0, 0, 1, 2, note, [])], source_pages=[1])
+    first = PageResult(1, True, [table], page_height=1000)
+    tail = TextBlock(60, "безопасности труда. Вредные вещества.")
+    quote = TextBlock(100, "».")
+    next_text = TextBlock(200, "Следующий пункт")
+    second = PageResult(2, True, [tail, quote, next_text], page_height=1000)
+    output, log = stitch_tables([first, second])
+    assert output[0].blocks[0].cells[0].text == note + "\n" + tail.text
+    assert output[0].blocks[0].source_pages == [1, 2]
+    assert output[1].blocks == [quote, next_text]
+    assert first.blocks[0].cells[0].text == note
+    assert second.blocks == [tail, quote, next_text]
+    no_quote = PageResult(2, True, [tail, next_text], page_height=1000)
+    output, _ = stitch_tables([first, no_quote])
+    assert output[0].blocks[0].cells[0].text == note
 from npa_ocr.ocr_table import TableCell
 from npa_ocr.table_stitch import merge_continuation
 
@@ -78,10 +109,10 @@ def test_docx_has_no_page_break_before_continuation(tmp_path):
     from docx import Document
 
     pages = [_page("191", 12), _page("191", 13)]
-    build_docx(pages, tmp_path / "raw.docx")
+    build_docx(pages, tmp_path / "raw.docx", diagnostic=True)
     stitched, _ = stitch_tables(pages)
     assert [p.continues_table for p in stitched] == [False, True]
-    build_docx(stitched, tmp_path / "stitched.docx")
+    build_docx(stitched, tmp_path / "stitched.docx", diagnostic=True)
     assert _page_breaks(tmp_path / "raw.docx") == 1
     assert _page_breaks(tmp_path / "stitched.docx") == 0
     assert [len(t.rows) for t in Document(str(tmp_path / "stitched.docx")).tables] == [16]
@@ -119,6 +150,29 @@ def test_tail_merges_low_confidence_flags():
     merged = next(c for c in cells if (c.row, c.col) == (0, 1))
     assert merged.text == "Азота оксид\n(азот монооксид)\nи иные"
     assert merged.low_lines == (False, True, False)
+
+
+def test_percentage_tail_does_not_duplicate_numeric_limits():
+    top = [_c(0, 0, "5."), _c(0, 1, "Кабинет с ПК, работа на ПК более"), _c(0, 2, "500")]
+    cont = [_c(0, 0, ""), _c(0, 1, "50% рабочей смены"), _c(0, 2, ""),
+            _c(1, 0, "6."), _c(1, 1, "Склад"), _c(1, 2, "5")]
+    cells, rows, _ = merge_continuation(top, 1, cont, 2)
+    assert rows == 2
+    assert next(c for c in cells if c.col == 1 and c.row == 0).text.endswith("более 50% рабочей смены")
+    assert [c.text for c in cells].count("500") == 1
+
+
+def test_continuation_with_new_internal_column_boundary_preserves_spans():
+    from npa_ocr.table_stitch import align_columns
+
+    top = [_c(0, 0, "2."), _c(0, 1, "Столы"), _c(0, 2, "340 мм")]
+    cont = [_c(0, 0, ""), _c(0, 1, "дошкольные"), _c(0, 2, "0"), _c(0, 3, "400 мм")]
+    aligned = align_columns(top, [0, .1, .6, 1], cont, [0, .101, .3, .601, 1])
+    assert aligned is not None
+    a, b, edges = aligned
+    assert len(edges) == 5
+    assert a[1].col == 1 and a[1].col_span == 2
+    assert b[-1].col == 3 and b[-1].col_span == 1
 
 
 def test_capitalized_first_row_is_new_row_not_tail():

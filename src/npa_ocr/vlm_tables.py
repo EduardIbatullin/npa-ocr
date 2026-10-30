@@ -127,6 +127,7 @@ class DsTable:
 
     bbox: list[int]  # пиксели страницы
     html: str
+    ruled: bool = False
 
 
 def parse_deepseek(raw: str, width: int, height: int) -> list[DsTable]:
@@ -227,6 +228,10 @@ def cell_text(html: str) -> str:
     надстрочными и подстрочными знаками («мг/нм³»), остальная разметка
     удаляется.
     """
+    from npa_ocr.response_validation import UNREADABLE, is_service_response
+
+    if is_service_response(unescape(html)):
+        return UNREADABLE
     h = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
 
     def script(m: re.Match) -> str:
@@ -237,7 +242,9 @@ def cell_text(html: str) -> str:
 
     h = re.sub(r"<(sup|sub)>(.*?)</\1>", script, h, flags=re.S | re.I)
     h = unescape(re.sub(r"<[^>]+>", " ", h))
-    return "\n".join(" ".join(line.split()) for line in h.split("\n") if line.strip())
+    from npa_ocr.scientific_text import chemical_indices
+
+    return chemical_indices("\n".join(" ".join(line.split()) for line in h.split("\n") if line.strip()))
 
 
 # --- 1–2. Сетка по линиям ---
@@ -262,6 +269,8 @@ class _Cell:
     ink: bool = False       # в ячейке что-то напечатано (даже если Tesseract не прочёл)
     ds_ids: list[int] = field(default_factory=list)
     rot: int = 0            # поворот, при котором Tesseract прочёл вертикальный текст
+    literal: str | None = None  # однозначный короткий знак по геометрии изображения
+    expected: str = ""      # тип графы из её заголовка
 
 
 def _line_masks(gray):
@@ -328,6 +337,11 @@ def _detect_cells(img: Image.Image) -> tuple[list[_Cell], dict]:
     if not cells:
         info["why"] = "ячеек нет"
         return [], info
+    # При разрыве внешней рамки фон может обойти несколько настоящих ячеек.
+    # Такой компонент не является гигантской объединённой ячейкой.
+    cells = [c for c in cells if not any(
+        d is not c and c.x0 <= d.x0 and c.y0 <= d.y0 and c.x1 >= d.x1 and c.y1 >= d.y1
+        for d in cells)]
     tol = 14
     xe = _cluster([c.x0 for c in cells] + [c.x1 for c in cells], tol)
     ye = _cluster([c.y0 for c in cells] + [c.y1 for c in cells], tol)
@@ -350,8 +364,46 @@ def _detect_cells(img: Image.Image) -> tuple[list[_Cell], dict]:
                 overlap += (c.r + dr, c.c + dc) in taken
                 taken[(c.r + dr, c.c + dc)] = k
     n_rows, n_cols = len(ye) - 1, len(xe) - 1
+    # Восстанавливаем пропуски сетки по сохранившимся разделителям. Это
+    # помогает строкам-разделам и крайним ячейкам с разорванной рамкой.
+    missing = {(r, c) for r in range(n_rows) for c in range(n_cols) if (r, c) not in taken}
+    repaired = 0
+    # Утолщённые линии нужны для связности, но их выступающие концы не
+    # должны превращать широкую строку-раздел в несколько узких ячеек.
+    v_core = cv2.erode(vert, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 25)))
+    h_core = cv2.erode(horiz, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 3)))
+    if not overlap and len(missing) <= 0.4 * max(1, n_rows * n_cols):
+        while missing:
+            seed = min(missing)
+            group, stack = {seed}, [seed]
+            missing.remove(seed)
+            while stack:
+                r, c = stack.pop()
+                for rr, cc in [(r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)]:
+                    if (rr, cc) not in missing:
+                        continue
+                    if rr == r:
+                        edge = xe[max(c, cc)]
+                        strip = v_core[ye[r] + 3:ye[r + 1] - 3, max(0, edge - 4):edge + 5]
+                        divided = strip.size > 0 and (strip > 0).any(axis=1).mean() > 0.4
+                    else:
+                        edge = ye[max(r, rr)]
+                        strip = h_core[max(0, edge - 4):edge + 5, xe[c] + 3:xe[c + 1] - 3]
+                        divided = strip.size > 0 and (strip > 0).any(axis=0).mean() > 0.4
+                    if not divided:
+                        group.add((rr, cc)); stack.append((rr, cc)); missing.remove((rr, cc))
+            r0, r1 = min(r for r, _ in group), max(r for r, _ in group) + 1
+            c0, c1 = min(c for _, c in group), max(c for _, c in group) + 1
+            if len(group) != (r1 - r0) * (c1 - c0):
+                continue
+            cells.append(_Cell(xe[c0] + 2, ye[r0] + 2, xe[c1] - 2, ye[r1] - 2,
+                               r=r0, c=c0, rs=r1 - r0, cs=c1 - c0))
+            for position in group:
+                taken[position] = len(cells) - 1
+            repaired += 1
     holes = n_rows * n_cols - len(taken)
-    info.update(ok=overlap == 0 and holes == 0, n_rows=n_rows, n_cols=n_cols, overlap=overlap, holes=holes, ye=ye)
+    info.update(ok=overlap == 0 and holes == 0, n_rows=n_rows, n_cols=n_cols, overlap=overlap,
+                holes=holes, repaired=repaired, ye=ye, xe=xe)
     cells.sort(key=lambda c: (c.r, c.c))
     return cells, info
 
@@ -383,7 +435,27 @@ def _tesseract_into_cells(img: Image.Image, cells: list[_Cell]) -> None:
                                   output_type=pytesseract.Output.DICT)
     for c in cells:
         inner = clean[c.y0 + 6:c.y1 - 6, c.x0 + 6:c.x1 - 6]
+        from npa_ocr.stroke_geometry import faint_dash
+        if faint_dash(gray[c.y0+6:c.y1-6,c.x0+6:c.x1-6]):
+            c.literal = "—"
+            c.ink = True
         c.ink = inner.size > 0 and (inner < 128).mean() > 0.002
+        c.ink = c.ink or c.literal is not None
+        if inner.size:
+            binary = (inner < 128).astype(np.uint8)
+            count, _, components, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+            visible = [components[k] for k in range(1, count) if components[k, cv2.CC_STAT_AREA] >= 5]
+            # Одиночная цифра в высокой объединённой ячейке занимает меньше
+            # порога доли чернил. Такой фрагмент нельзя объявлять пустым.
+            c.ink = c.ink or any(s[cv2.CC_STAT_HEIGHT] >= 8 and s[cv2.CC_STAT_WIDTH] >= 2
+                                and s[cv2.CC_STAT_AREA] >= 12 for s in visible)
+            # Короткий горизонтальный штрих в пустой ячейке — прочерк,
+            # а не цифра 1 или римская I от повторного чтения модели.
+            if len(visible) == 1:
+                _, _, width, height, area = visible[0]
+                if width >= 8 and width >= 3 * height and height <= 8 and area >= width:
+                    c.literal = "—"
+                    c.ink = True
     words: dict[int, list[tuple[int, int, str]]] = {}
     for i, t in enumerate(d["text"]):
         t = t.strip()
@@ -423,6 +495,73 @@ def _tesseract_into_cells(img: Image.Image, cells: list[_Cell]) -> None:
             if _letters(best) >= 4:
                 c.tess, c.rot = best, best_a
                 c.text_y = c.y0
+    for c in cells:
+        if c.literal is not None and re.fullmatch(r"\s*1[.]?\s*", c.tess):
+            # Поворот узкой цифры в шапке может выглядеть как штрих.
+            # Явно прочитанное число не заменяется геометрической догадкой.
+            c.literal = None
+        if c.literal is not None:
+            c.tess = c.literal
+
+
+def _set_column_types(cells: list[_Cell]) -> None:
+    """Определяет типы граф по распознанным заголовкам, не по значениям норм."""
+    from npa_ocr.scientific_text import ROMAN_CODE, doubtful_roman_code, section_heading
+
+    types: dict[int, str] = {}
+    headers: set[int] = set()
+    for c in cells:
+        if c.cs != 1:
+            continue
+        text = (c.tess + " " + cell_text(c.text)).lower()
+        kind = ""
+        if "формул" in text:
+            kind = "formula"
+        elif "регистрацион" in text or re.search(r"\bcas\b", text):
+            kind = "cas"
+        elif "категория работ" in text or "разряд" in text:
+            kind = "code"
+        elif "наименование" in text:
+            kind = "name"
+        elif "п/п" in text or text.strip() == "№":
+            kind = "index"
+        elif ("класс опасности" in text or "количество" in text or "величина" in text
+              or "освещенность, лк" in text or "освещённость, лк" in text):
+            kind = "number"
+        if kind:
+            types[c.c] = kind
+            headers.add(id(c))
+    # В продолжении таблицы заголовка может не быть: тип графы определяется
+    # по большинству её коротких записей, но никогда по ожидаемому числу.
+    for col in {c.c for c in cells if c.cs == 1} - types.keys():
+        values = [cell_text(c.text) or c.tess for c in cells if c.c == col and c.cs == 1]
+        values = [v.strip() for v in values if v.strip() and len(v) < 40]
+        column = [c for c in cells if c.c == col and c.cs == 1]
+        if (col == 0 and len(column) >= 3 and values
+                and all(re.fullmatch(r"\d{1,4}[.]?", v) for v in values)
+                and max(c.x1 - c.x0 for c in column) < .08 * max(c.x1 for c in cells)):
+            types[col] = "index"
+            continue
+        if len(values) < 2:
+            continue
+        codes = sum(bool(ROMAN_CODE.fullmatch(v)) or doubtful_roman_code(v) for v in values)
+        numbers = sum(bool(re.fullmatch(r"[\d.,*\s–—−-]+", v)) for v in values)
+        if codes >= max(3, .6 * len(values)):
+            types[col] = "code"
+        elif numbers >= max(2, .8 * len(values)):
+            types[col] = "index" if col == 0 else "number"
+    for c in cells:
+        if id(c) not in headers and c.cs == 1:
+            c.expected = types.get(c.c, "")
+            if c.expected == "name" and "formula" in types.values() and "cas" in types.values():
+                c.expected = "chemical_name"
+        elif c.cs > 1:
+            text = cell_text(c.text) or c.tess
+            if section_heading(text) or re.match(r"^[IVXLC1l|ГТПШУХ!тiх.:\s]{1,15}[А-ЯЁ][а-яё]{2}",text):
+                c.expected = "section"
+            elif ("регистрационный номер" in text.lower() or "частотной коррекции" in text
+                  or re.search(r"ГОСТ Р\s+[\d.]+/", text)):
+                c.expected = "mixed"
 
 
 class _Rows(HTMLParser):
@@ -734,10 +873,37 @@ def _doubt_kind(c: _Cell) -> str | None:
         текста нет; ``"mismatch"`` — текст DeepSeek не похож на прочитанное
         Tesseract; None — ячейка не сомнительна.
     """
+    from npa_ocr.response_validation import is_service_response
+
+    if is_service_response(c.text):
+        return "empty"
+    if c.expected in ("formula", "chemical_name") and c.literal is None:
+        return c.expected
+    if c.expected == "section":
+        return "section"
+    if c.src == "local":
+        return None
+    if c.literal is not None:
+        return None
+    from npa_ocr.response_validation import matches_cell_type
+
+    if c.text and c.expected and not matches_cell_type(cell_text(c.text), c.expected):
+        return "schema"
     if c.src == "tess":
         return "tess"
+    from npa_ocr.scientific_text import doubtful_roman_code
+
+    if doubtful_roman_code(cell_text(c.text)):
+        return "code"
     if c.ink and not c.text:
         return "empty"
+    if c.src in ("ds", "pos") and c.tess:
+        a, b = norm(c.tess), norm(cell_text(c.text))
+        # Даже одна цифра важна: 20 и 2, прочерк и 1 не требуют четырёх букв.
+        if re.findall(r"\d+", a) != re.findall(r"\d+", b):
+            return "mismatch"
+        if a != b and (re.fullmatch(r"[-–—−1Il|]+", a) or re.fullmatch(r"[-–—−1Il|]+", b)):
+            return "mismatch"
     # вертикальный текст (Tesseract прочёл его с поворотом) DeepSeek читает заметно хуже —
     # там сомнительно любое расхождение
     if c.src in ("ds", "pos") and _letters(c.tess) >= 4 and sim(c.tess, _plain(c.text)) < (0.95 if c.rot else 0.5):
@@ -758,8 +924,12 @@ def _doubt(cells: list[_Cell]) -> list[dict]:
     for c in cells:
         kind = _doubt_kind(c)
         if kind:
+            numbered=[(x.c,int(cell_text(x.text))) for x in cells if x.r==c.r and x.rs==1 and x.cs==1
+                      and re.fullmatch(r'\d{1,2}',cell_text(x.text))]
+            numbering=(c.r<=2 and len(numbered)>=3 and all(value-col==1 for col,value in numbered))
             out.append({"r": c.r, "c": c.c, "box": [c.x0, c.y0, c.x1, c.y1], "rot": c.rot, "tess": c.tess,
-                        "left": left_of(c), "kind": kind, "ds": _plain(c.text) if kind == "mismatch" else ""})
+                        "left": left_of(c), "kind": kind, "ds": cell_text(c.text) if kind in ("mismatch", "formula", "chemical_name", "section") else "",
+                        "expected": c.expected,"numbering":numbering})
     return out
 
 
@@ -779,6 +949,10 @@ def rebuild(img: Image.Image, ds_html: str) -> GridResult:
         info.update(ds_cells=len(ds), ds_lost=len(ds))
         return GridResult(False, [], 0, 0, info)
     _tesseract_into_cells(img, cells)
+    from npa_ocr.cell_reading import split_index_cells
+
+    info["split_index"] = split_index_cells(img, cells, info["ye"])
+    _set_column_types(cells)
     rich = _cell_html(ds_html)
     if len(rich) != len(ds):
         rich = [escape(d.text) for d in ds]
@@ -790,6 +964,18 @@ def rebuild(img: Image.Image, ds_html: str) -> GridResult:
             c.src = c.src or "ds"
         elif c.tess:
             c.text, c.src = escape(c.tess), "tess"
+        if (c.literal is not None and c.expected not in ("number", "index", "code")
+                and re.fullmatch(r"\s*1[.]?\s*", cell_text(c.text))):
+            # Несогласие модели с коротким штрихом требует повторного
+            # чтения: штрих может быть повёрнутой цифрой в узкой шапке.
+            c.literal = None
+        if c.literal is not None:
+            c.text, c.src = c.literal, "visual"
+    _set_column_types(cells)
+    from npa_ocr.cell_reading import verify_cells, orient_numbering
+
+    orient_numbering(img,cells)
+    verify_cells(img, cells)
     n_split = _split_values(cells, ds)
     doubt = _doubt(cells)
     lost = [ds[j].text for j in range(len(ds)) if not any(j in c.ds_ids for c in cells)]
@@ -807,8 +993,14 @@ def rebuild(img: Image.Image, ds_html: str) -> GridResult:
                 split=n_split)
     out = []
     for c in cells:
-        text = cell_text(c.text)
-        low = c.src in ("tess", "pos")
+        from npa_ocr.response_validation import UNREADABLE
+
+        text = cell_text(c.text) or (UNREADABLE if c.ink else "")
+        if c.expected == "formula" and text:
+            from npa_ocr.response_validation import matches_cell_type
+            if not matches_cell_type(text, "formula"):
+                text = UNREADABLE
+        low = c.src in ("tess", "pos", "local") or _doubt_kind(c) is not None or text == UNREADABLE
         out.append(TableCell(c.r, c.c, c.rs, c.cs, text,
                              (True,) * len(text.split("\n")) if low and text else ()))
     return GridResult(True, out, info["n_rows"], info["n_cols"], info, doubt)
@@ -821,13 +1013,15 @@ RereadFn = Callable[[Image.Image, list[dict]], dict[tuple[int, int], str]]
 def apply_reread(cells: list[TableCell], texts: dict[tuple[int, int], str]) -> list[TableCell]:
     """Подставляет в ячейки текст повторного чтения.
 
-    Текст уже проверен (:func:`npa_ocr.vlm_reread.accept`), поэтому пометка
-    неуверенности снимается.
+    Повторное чтение не доказывает правильность результата: исправленные
+    ячейки остаются выделенными для сверки со сканом.
     """
     out = []
     for c in cells:
         t = texts.get((c.row, c.col))
-        out.append(c if t is None else TableCell(c.row, c.col, c.row_span, c.col_span, cell_text(escape(t))))
+        text = cell_text(escape(t)) if t is not None else None
+        out.append(c if text is None else TableCell(c.row, c.col, c.row_span, c.col_span, text,
+                                                    (True,) * len(text.split("\n"))))
     return out
 
 
@@ -851,7 +1045,11 @@ def html_cells(html: str) -> tuple[list[TableCell], int, int]:
             for dr in range(rs):
                 for dc in range(cs):
                     taken.add((r + dr, c + dc))
-            cells.append(TableCell(r, c, rs, cs, cell_text(inner)))
+            text = cell_text(inner)
+            from npa_ocr.response_validation import is_service_response
+
+            cells.append(TableCell(r, c, rs, cs, text,
+                                   (True,) * len(text.split("\n")) if is_service_response(text) else ()))
             c += cs
     n_rows = max((x.row + x.row_span for x in cells), default=0)
     n_cols = max((x.col + x.col_span for x in cells), default=0)
@@ -933,7 +1131,7 @@ def page_tables(page: Image.Image, tables: list[DsTable], reread_fn: RereadFn | 
     Returns:
         Таблицы сверху вниз.
     """
-    boxes = [refine_bbox(page, t.bbox) for t in tables]
+    boxes = [t.bbox if t.ruled else refine_bbox(page, t.bbox) for t in tables]
     groups: list[list[int]] = []
     for k, b in enumerate(boxes):
         g = next((g for g in groups if any(_overlap(b, boxes[i]) > 0.5 for i in g)), None)
@@ -948,9 +1146,16 @@ def page_tables(page: Image.Image, tables: list[DsTable], reread_fn: RereadFn | 
         html = "<table>" + "".join(re.sub(r"</?table[^>]*>", "", tables[i].html) for i in g) + "</table>"
         crop = page.crop(box)
         res = rebuild(crop, html)
+        unruled_body = False
+        if res.ok and res.info["ds_lost"] > _MAX_LOST_SHARE * max(res.info["ds_cells"], 1):
+            # Бывает разлинована только шапка: тогда текст настоящего тела
+            # ниже рамки должен подтверждаться на странице, а не одним HTML.
+            fallback_cells, _, _ = html_cells(html)
+            extended = extend_to_rows(page, box, fallback_cells, page.height)
+            unruled_body = extended[3] > box[3] + 20
         # сетка по линиям, если она вместила текст DeepSeek; иначе (нет линий в теле таблицы
         # или сетка не построилась) — HTML DeepSeek как есть
-        if res.ok and res.info["ds_lost"] <= _MAX_LOST_SHARE * max(res.info["ds_cells"], 1):
+        if res.ok and not unruled_body:
             cells = res.cells
             if reread_fn is not None and res.doubt:
                 texts = reread_fn(crop, res.doubt)
@@ -1041,4 +1246,59 @@ def run_vlm_tables(
     """
     page = Image.open(image_path).convert("RGB")
     raw = chat_fn(page)
-    return page_tables(page, parse_deepseek(raw, page.width, page.height), reread_fn)
+    tables = parse_deepseek(raw, page.width, page.height)
+    # Отсутствие HTML не означает отсутствия таблицы: проверяем разлиновку
+    # независимо от модели и отдельно читаем пропущенный регион.
+    for box in ruled_regions(page):
+        members = [t for t in tables if _region_coverage(t.bbox, box) >= 0.8]
+        if members:
+            # Разделы одной физической сетки объединяются до сопоставления
+            # текста. Повторный ответ модели не добавляется поверх исходных
+            # фрагментов: иначе появляются дубли и выдуманные строки.
+            html = [t.html for t in sorted(members, key=lambda t: t.bbox[1])]
+        else:
+            recovered = chat_fn(page.crop(box))
+            html = re.findall(r"<table\b.*?</table>", recovered, re.S | re.I)
+        if not html:
+            # Разлиновка подтверждает таблицу независимо от качества ответа.
+            # Пустой HTML позволит восстановить её по Tesseract и явно
+            # отметить те напечатанные ячейки, которые не удалось прочитать.
+            html = ["<table></table>"]
+        tables = [t for t in tables if t not in members]
+        tables.append(DsTable(box, "<table>" + "".join(
+            re.sub(r"</?table[^>]*>", "", h) for h in html) + "</table>", ruled=True))
+    return page_tables(page, tables, reread_fn)
+
+
+def _region_coverage(region: list[int], box: list[int]) -> float:
+    """Доля региона, покрытая рамкой уже распознанной таблицы."""
+    area = max(1, (region[2] - region[0]) * (region[3] - region[1]))
+    return max(0, min(region[2], box[2]) - max(region[0], box[0])) * max(
+        0, min(region[3], box[3]) - max(region[1], box[1])) / area
+
+
+def ruled_regions(page: Image.Image) -> list[list[int]]:
+    """Находит крупные связные сетки независимо от ответа модели.
+
+    Рамки скана, одиночные подчёркивания и небольшие метки не считаются
+    таблицами: нужны несколько длинных горизонтальных и вертикальных линий.
+    """
+    import cv2
+    import numpy as np
+
+    h, v = _line_masks(np.array(page.convert("L")))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(cv2.bitwise_or(h, v), connectivity=8)
+    result = []
+    for i in range(1, count):
+        x, y, w, height, _ = map(int, stats[i])
+        if w < page.width * 0.35 or height < page.height * 0.08:
+            continue
+        if x < 5 or y < 5 or x + w >= page.width - 5 or y + height >= page.height - 5:
+            continue
+        rows = np.where((h[y:y + height, x:x + w] > 0).sum(axis=1) > w * 0.5)[0]
+        cols = np.where((v[y:y + height, x:x + w] > 0).sum(axis=0) > height * 0.3)[0]
+        if len(_cluster(rows.tolist(), 8)) < 3 or len(_cluster(cols.tolist(), 8)) < 3:
+            continue
+        result.append([max(0, x - 12), max(0, y - 12),
+                       min(page.width, x + w + 12), min(page.height, y + height + 12)])
+    return sorted(result, key=lambda b: b[1])

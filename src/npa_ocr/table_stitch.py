@@ -62,6 +62,46 @@ def _append_tail(top: TableCell, tail: TableCell) -> TableCell:
     return replace(top, text=f"{top.text} {tail.text}".strip(), low_lines=flags if any(flags) else ())
 
 
+def align_columns(
+    top: list[TableCell], top_edges: list[float], cont: list[TableCell], cont_edges: list[float],
+) -> tuple[list[TableCell], list[TableCell], list[float]] | None:
+    """Приводит близкие границы граф двух страниц к общей элементарной сетке.
+
+    Дополнительная граница внутри объединённой ячейки допустима. Если
+    большинство границ различается, таблицы не считаются продолжением.
+    """
+    if len(top_edges) < 2 or len(cont_edges) < 2:
+        return None
+    tolerance = 0.012
+    shared = sum(any(abs(a - b) <= tolerance for b in cont_edges) for a in top_edges)
+    # A continuation can use fewer divisions (a new section of the same
+    # table). Requiring 70% of the larger grid split such continuations.
+    subset = (min(len(top_edges), len(cont_edges)) >= 4
+              and abs(top_edges[0] - cont_edges[0]) <= tolerance
+              and abs(top_edges[-1] - cont_edges[-1]) <= tolerance
+              and sum(any(abs(a - b) <= tolerance for a in top_edges) for b in cont_edges)
+                  >= .9 * len(cont_edges))
+    if shared < 0.7 * max(len(top_edges), len(cont_edges)) and not subset:
+        return None
+    if len(top_edges) == len(cont_edges) and all(abs(a-b) <= .02 for a,b in zip(top_edges,cont_edges)):
+        # The same logical columns, with small scan/perspective drift.
+        # A union would create an artificial narrow column inside the body.
+        return list(top), list(cont), list(top_edges)
+    groups: list[list[float]] = []
+    for edge in sorted(top_edges + cont_edges):
+        if groups and edge - groups[-1][0] <= tolerance:
+            groups[-1].append(edge)
+        else:
+            groups.append([edge])
+    edges = [sum(g) / len(g) for g in groups]
+
+    def remap(cells: list[TableCell], old: list[float]) -> list[TableCell]:
+        mapping = [min(range(len(edges)), key=lambda i: abs(edges[i] - x)) for x in old]
+        return [replace(c, col=mapping[c.col], col_span=mapping[c.col + c.col_span] - mapping[c.col]) for c in cells]
+
+    return remap(top, top_edges), remap(cont, cont_edges), edges
+
+
 def _shift(cells: list[TableCell], dr: int) -> list[TableCell]:
     """Сдвигает ячейки на ``dr`` строк."""
     return [replace(x, row=x.row + dr) for x in cells]
@@ -112,7 +152,15 @@ def merge_continuation(
     # текста последней строки верхней части (объединения через эту строку вниз продлит шаг 3)
     first = [x for x in _row(b, 0) if x.row_span == 1]
     filled = [x for x in first if _flat(x)]
-    if filled and len(filled) < len(first) and all(_TAIL_RE.match(_flat(x)) for x in filled):
+    def is_tail(cell: TableCell) -> bool:
+        """Продолжение текста, в том числе процент после «более/менее»."""
+        if _TAIL_RE.match(_flat(cell)):
+            return True
+        target = _covering(a, top_rows - 1, cell.col)
+        return bool(target and re.search(r"(?:более|менее)\s*$", _flat(target), re.I)
+                    and re.match(r"\d+(?:[.,]\d+)?\s*%", _flat(cell)))
+
+    if filled and len(filled) < len(first) and all(is_tail(x) for x in filled):
         for x in filled:
             target = _covering(a, top_rows - 1, x.col)
             if target is not None:
@@ -123,10 +171,25 @@ def merge_continuation(
     # 3. объединения, продолжающиеся на следующей странице
     removed: set[int] = set()
     for i, x in enumerate(b):
-        if x.row != 0 or _flat(x):
+        if x.row != 0:
             continue
         target = _covering(a, top_rows - 1, x.col)
         if target is None or not _flat(target) or target.col != x.col or target.col_span != x.col_span:
+            continue
+        if _flat(x):
+            index = _covering(b, 0, 0)
+            if (x.col == 1 and x.row_span > 1 and index is not None and not _flat(index)
+                    and _TAIL_RE.match(_flat(x)) and re.search(r"[а-яёA-Za-z]", _flat(target))
+                    and len(_flat(target)) <= 50 and not re.search(r"[\d()]", _flat(target))):
+                joined = _append_tail(target, x)
+                a[a.index(target)] = replace(joined, row_span=target.row_span + x.row_span)
+                removed.add(i)
+                log.append("соединено разрезанное наименование")
+            continue
+        # Пустота на новой странице не доказывает продолжение числовой
+        # нормы. Номер позиции в первой графе может продолжаться, но
+        # норматив из предыдущей строки нельзя переносить в новую.
+        if x.col > 0 and re.fullmatch(r"[\d\s.,*%–—−-]+", _flat(target)):
             continue
         # столбец продолжения не должен быть пуст целиком (пустая форма) — ниже в нём есть текст
         if not any(_flat(y) for y in b if y.col == x.col and y.row >= x.row_span) and x.row_span < cont_rows:
