@@ -92,6 +92,8 @@ def test_upright_quantity_cannot_be_rotated_into_a_dash(monkeypatch):
         return '1','stop',0
     result=_try_cell(ask,image,dict(box=[0,0,100,100],tess='',kind='empty',expected='number'))
     assert result['rot']==0 and result['used']=='1' and len(calls)==1
+    unconfirmed=_try_cell(ask,image,dict(box=[0,0,100,100],tess='Ка',kind='schema',expected='number',rot=90))
+    assert unconfirmed['rot']==0 and unconfirmed['used']=='1'
     header=_try_cell(ask,image,dict(box=[0,0,100,100],tess='',kind='empty',expected='number',numbering=True))
     assert header['used']=='1' and abs(header['rot'])==90
 

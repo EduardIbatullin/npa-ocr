@@ -310,6 +310,13 @@ def _try_cell(ask: AskFn, crop: Image.Image, d: dict) -> dict:
     текста нет и ответ отбракован, пробуются и повороты (повёрнутая цифра).
     """
 
+    short_value = (d.get("expected") in ("number", "index", "code", "cas")
+                   and not (d.get('numbering') or d.get('number_rotation')))
+    if short_value:
+        # Rotated Tesseract can turn digits in a tall merged cell into a few
+        # Cyrillic letters. That alone does not confirm numeric orientation.
+        d={**d,'rot':0}
+
     def read(rot: int) -> dict:
         """Читает ячейку, повёрнутую на ``rot`` градусов."""
         raw, reason, lp = ask(cell_image(crop, d, rot), "Free OCR.")
@@ -319,7 +326,6 @@ def _try_cell(ask: AskFn, crop: Image.Image, d: dict) -> dict:
 
     # An upright digit 1 is itself a tall component, not vertical writing.
     # Rotating it turns a quantity into a highly confident dash.
-    short_value = d.get("expected") in ("number", "index", "code", "cas") and not d.get('numbering')
     if d.get("rot") or (not short_value and is_vertical(_part(crop, d["box"]))):
         return max((read(90), read(-90)), key=lambda c: c["lp"])
     res = read(0)

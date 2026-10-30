@@ -119,3 +119,18 @@ def test_title_recovery_requires_matching_numbers(monkeypatch):
     assert all(w.restored for line in result for w in line)
     monkeypatch.setattr(pytesseract, "image_to_data", lambda *a, **k: data(title.replace("3.15", "3.16")))
     assert recover_titles(lines, raw, image) == lines
+
+
+def test_title_recovery_does_not_restore_cyrillic_pi_over_supported_roman_two(monkeypatch):
+    import pytesseract
+    from npa_ocr.text_recovery import recover_titles
+    title='II. При сбросе сточных вод в водный объект и эксплуатации очистных сооружений'
+    raw='title[[100, 100, 900, 200]]\n'+title
+    words=title.replace('II.','П.').split()
+    data=dict(text=words,left=[20+i*35 for i in range(len(words))],top=[10]*len(words),
+              width=[30]*len(words),height=[15]*len(words),conf=[90]*len(words),
+              block_num=[1]*len(words),par_num=[1]*len(words),line_num=[1]*len(words))
+    monkeypatch.setattr(pytesseract,'image_to_data',lambda *a,**k:data)
+    result=recover_titles([[Word('II.',90,(110,110,140,125)),Word('При',90,(145,110,175,125))]],
+                          raw,Image.new('RGB',(1000,1000),'white'))
+    assert ' '.join(w.text for line in result for w in line).startswith('II. При')
