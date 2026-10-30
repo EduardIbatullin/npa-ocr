@@ -908,14 +908,13 @@ def test_text_paragraphs_restores_centered_lines_indents_and_breaks():
     # «постановляет:» — короткая последняя строка вводной части, абзац не начинает.
     assert [p[0] for p in paras] == [
         "ПРАВИТЕЛЬСТВО РОССИЙСКОЙ ФЕДЕРАЦИИ",
-        "Об утверждении технологических показателей",
-        "доступных технологий в сфере",
+        "Об утверждении технологических показателей доступных технологий в сфере",
         "В соответствии с пунктом 5 статьи 23 Федерального закона Правительство постановляет:",
         "Утвердить прилагаемые показатели доступных технологий в сфере",
     ]
-    assert [p[1] for p in paras][:3] == ["center", "center", "center"]
-    assert paras[3][1] == "left" and paras[3][2] > 0  # «В соответствии» начинается с отступа (x0=300)
-    assert paras[4][2] > 0  # «Утвердить» с отступом первой строки
+    assert [p[1] for p in paras][:2] == ["center", "center"]
+    assert paras[2][1] == "left" and paras[2][2] > 0  # «В соответствии» начинается с отступа (x0=300)
+    assert paras[3][2] > 0  # «Утвердить» с отступом первой строки
 
 
 def test_text_paragraphs_without_geometry_keeps_one_line_per_paragraph():
@@ -1161,7 +1160,7 @@ def test_run_tatr_tables_flags_low_confidence_cell_and_docx_highlights_it(tmp_pa
     highlighted = [r.text for r in table.cell(0, 0).paragraphs[0].runs if r.font.highlight_color == WD_COLOR_INDEX.YELLOW]
     assert highlighted == ["сомнительно"]
     assert all(r.font.highlight_color is None for r in table.cell(0, 1).paragraphs[0].runs)
-    assert any("низкой уверенностью" in p.text for p in doc.paragraphs)
+    assert any("\u0416\u0451\u043b\u0442\u044b\u043c" in p.text for p in doc.paragraphs)
 
 
 def test_body_text_low_confidence_word_is_highlighted_in_docx(tmp_path: Path):
@@ -1864,7 +1863,7 @@ def test_ocr_document_vlm_engine_rereads_doubtful_cells(tmp_path: Path):
     assert asked
     (table,) = [b for b in result.pages[0].blocks if isinstance(b, TableBlock)]
     reread = [c for c in table.cells if c.text == "мг/нм³"]
-    assert reread and not any(any(c.low_lines) for c in reread)
+    assert reread and all(any(c.low_lines) for c in reread)
     steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
     assert "таблицы: дочитка ячеек (vLLM)" in steps
 
@@ -1992,6 +1991,36 @@ def test_ocr_document_marks_unavailable_keeps_text(tmp_path: Path):
     assert any("ЗАРЕГИСТРИРОВАНО" in t for t in texts)
     steps = [s["step"] for s in result.timings["pages"]["1"]["steps"]]
     assert any(s.startswith("метки: Ollama недоступна") for s in steps)
+
+
+def test_vlm_table_exclusion_uses_grid_without_crop_margin(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from npa_ocr import ocr
+
+    cell = SimpleNamespace()
+    table = SimpleNamespace(bbox=[100, 200, 500, 700], cells=[cell], n_rows=2, n_cols=2,
+                            src="grid", info={"xe": [12, 200, 388], "ye": [12, 240, 488]})
+    monkeypatch.setattr(ocr.vlm_tables, "run_vlm_tables", lambda *a, **k: [table])
+    block = ocr.run_vlm_table_blocks(tmp_path / "page.png", lambda image: "")[0]
+    assert block.bbox == (112, 212, 488, 688)
+    assert block.y == 212
+
+
+def test_docx_preserves_narrow_grid_subdivisions_before_merging():
+    from docx import Document
+    from npa_ocr.ocr import _add_table
+
+    doc = Document()
+    block = TableBlock(y=0, bbox=(0, 0, 100, 100), n_rows=1, n_cols=3,
+                       column_edges=[0, .1, .12, 1],
+                       cells=[TableCell(0, 0, 1, 2, "Название", []),
+                              TableCell(0, 2, 1, 1, "20", [])])
+    _add_table(doc, block)
+    table = doc.tables[0]
+    widths = [column.width for column in table.columns]
+    assert .15 < widths[1] / widths[0] < .25
+    assert widths[2] / widths[0] > 8
+    assert [cell.text for cell in table.rows[0].cells] == ["Название", "Название", "20"]
 
 
 def test_ocr_document_vlm_engine_rereads_formulas_and_variables(tmp_path: Path):

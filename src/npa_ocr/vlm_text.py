@@ -256,6 +256,37 @@ def tokens(text: str) -> list[str]:
     return [_markup(t) for t in _TOKEN_RE.findall(text.replace("<br>", " ")) if t.strip("#")]
 
 
+def _join_fragmented_lines(lines: list[list[Word]], blocks) -> list[list[Word]]:
+    """Соединяет фрагменты одной строки внутри подтверждённого текстового блока."""
+    text_boxes = [box for label, box, _ in blocks if label not in ("table", "image", "equation")]
+    groups: list[list[Word]] = []
+    for line in lines:
+        if not line:
+            continue
+        height = max(w.box[3] - w.box[1] for w in line)
+        baseline = max(w.box[3] for w in line)
+        joined = False
+        for group in reversed(groups[-4:]):
+            gh = max(w.box[3] - w.box[1] for w in group)
+            gb = max(w.box[3] for w in group)
+            left, right = sorted((group, line), key=lambda ws: min(w.box[0] for w in ws))
+            gap = min(w.box[0] for w in right) - max(w.box[2] for w in left)
+            if abs(baseline - gb) > 0.3 * max(height, gh) or not (0 <= gap <= 5 * max(height, gh)):
+                continue
+            all_words = group + line
+            if not any(all(b[0] - 8 <= (w.box[0] + w.box[2]) / 2 <= b[2] + 8
+                           and b[1] - 8 <= (w.box[1] + w.box[3]) / 2 <= b[3] + 8 for w in all_words)
+                       for b in text_boxes):
+                continue
+            group.extend(line)
+            group.sort(key=lambda w: w.box[0])
+            joined = True
+            break
+        if not joined:
+            groups.append(list(line))
+    return groups
+
+
 def reread_lines(lines: list[list[Word]], ds_raw: str | None, width: int, height: int
                  ) -> tuple[list[list[Word]], list[Formula]]:
     """Исправляет строки Tesseract по ответу DeepSeek-OCR на страницу.
@@ -272,6 +303,7 @@ def reread_lines(lines: list[list[Word]], ds_raw: str | None, width: int, height
     if not ds_raw:
         return lines, []
     blocks = ds_blocks(ds_raw, width, height)
+    lines = _join_fragmented_lines(lines, blocks)
     formulas = []
     for label, box, text in blocks:
         if label == "equation":
@@ -301,6 +333,26 @@ def reread_lines(lines: list[list[Word]], ds_raw: str | None, width: int, height
                 for wi in range(len(line))]
         if not refs:
             continue
+        # Отдельный блок рукописной даты не имеет слова-якоря. Его можно
+        # использовать только поверх повреждённой даты, в тех же координатах.
+        date_text = text.strip()
+        if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", date_text) and box[3] < 0.35 * height:
+            local = [(li, wi) for li, wi in refs
+                     if box[0] - 8 <= (lines[li][wi].box[0] + lines[li][wi].box[2]) / 2 <= box[2] + 8]
+            if local and len({li for li, _ in local}) == 1:
+                old = [lines[li][wi] for li, wi in local]
+                raw_date = "".join(w.text for w in old)
+                if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", raw_date) and len(re.findall(r"\d", raw_date)) >= 4:
+                    from datetime import datetime
+
+                    try:
+                        datetime.strptime(date_text, "%d.%m.%Y")
+                    except ValueError:
+                        pass
+                    else:
+                        li, wi = local[0]
+                        replaced.setdefault(li, {})[wi] = (len(old), _span_words(old, [date_text]))
+                        continue
         tess = [lines[li][wi] for li, wi in refs]
         sm = difflib.SequenceMatcher(None, [_norm(t) for t in ds], [_norm(w.text) for w in tess], autojunk=False)
         ops = sm.get_opcodes()

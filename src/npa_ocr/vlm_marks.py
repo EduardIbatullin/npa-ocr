@@ -114,11 +114,16 @@ def qwen_locate(image: Image.Image) -> str:
     Raises:
         MarksUnavailable: Ollama недоступна или ответ не разобран.
     """
+    return qwen_read(image, MARKS_PROMPT, timeout=MARKS_TIMEOUT)
+
+
+def qwen_read(image: Image.Image, prompt: str, *, timeout: float = 90) -> str:
+    """Read a small difficult crop with the independent vision model."""
     buf = io.BytesIO()
     image.convert("RGB").save(buf, format="PNG")
     payload = {
         "model": MARKS_MODEL,
-        "prompt": MARKS_PROMPT,
+        "prompt": prompt,
         "images": [base64.b64encode(buf.getvalue()).decode()],
         "stream": False,
         "think": False,
@@ -130,7 +135,7 @@ def qwen_locate(image: Image.Image) -> str:
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=MARKS_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read())["response"]
     except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError, KeyError) as exc:
         raise MarksUnavailable(f"Ollama ({OLLAMA_URL}, {MARKS_MODEL}) недоступна: {exc}") from exc

@@ -29,6 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("pdf", help="Путь к PDF")
     parser.add_argument("--out", help="Путь к выходному DOCX (по умолчанию <pdf>.docx)")
+    parser.add_argument("--diagnostic", action="store_true",
+                        help="Добавлять к таблицам подписи со страницами исходного PDF")
     parser.add_argument(
         "--authority-name",
         help=(
@@ -109,6 +111,7 @@ def cmd_ocr(args: argparse.Namespace) -> int:
             use_ai_escalation=args.ai_escalation,
             auto_rotate=not args.no_auto_rotate,
             table_engine=args.table_engine,
+            diagnostic=getattr(args, "diagnostic", False),
         )
     except InsufficientMemoryError as exc:
         print(json.dumps({"status": "insufficient_memory", "message": str(exc)}, ensure_ascii=False, indent=2))
