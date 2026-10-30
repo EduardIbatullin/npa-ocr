@@ -8,6 +8,13 @@ from npa_ocr.vlm_tables import _Cell, _doubt_kind, apply_reread, cell_text, html
 from npa_ocr.response_validation import UNREADABLE
 
 
+@pytest.mark.parametrize('value',['≤ 50','≥ 1','< 0,1','> 2','<= 50'])
+def test_numeric_schema_accepts_comparison_operators(value):
+    from npa_ocr.response_validation import matches_cell_type
+    assert matches_cell_type(value,'number')
+    assert accept(value,{'tess':value,'expected':'number'},lp=0)==value
+
+
 @pytest.mark.parametrize("text", [
     '{ "Line": { "line_type": ["-"], "line_endpoint": ["I: (8, 0)"] } }',
     "I'm sorry, but the image provided is a graphic design and not a data chart.",

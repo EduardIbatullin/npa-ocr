@@ -248,7 +248,7 @@ def cell_image(crop: Image.Image, d: dict, rot: int = 0) -> Image.Image:
         Повёрнутая и при необходимости увеличенная ячейка с белым полем.
     """
     part = _part(crop, d["box"])
-    if d.get('expected')=='number' and not rot and not d.get('rot'):
+    if d.get('clean_side_rule') and not rot and not d.get('rot'):
         from npa_ocr.stroke_geometry import remove_broken_side_rule
         part=remove_broken_side_rule(part).convert('L')
     if rot:
@@ -323,6 +323,14 @@ def _try_cell(ask: AskFn, crop: Image.Image, d: dict) -> dict:
     if d.get("rot") or (not short_value and is_vertical(_part(crop, d["box"]))):
         return max((read(90), read(-90)), key=lambda c: c["lp"])
     res = read(0)
+    if (res['used'] is None and d.get('expected')=='number'
+            and re.fullmatch(r'\d+(?:[.,]\d+)?(?:\.{2,}|…)',res.get('vlm',''))):
+        cleaned={**d,'clean_side_rule':True}
+        raw,reason,lp=ask(cell_image(crop,cleaned),'Free OCR.')
+        text=clean(raw)
+        got=_keep_ds(accept(text,d,lp) if reason!='length' else None,lp,d)
+        if got is not None:
+            return {'vlm':text,'lp':lp,'rot':0,'used':got}
     if res["used"] is None and (not d["tess"] or d.get('numbering')) and not short_value:
         res = max((res, read(90), read(-90)), key=lambda c: (c["used"] is not None, c["lp"]))
     return res
