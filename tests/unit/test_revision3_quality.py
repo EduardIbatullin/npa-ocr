@@ -69,7 +69,7 @@ def test_export_keeps_caption_header_and_short_rows_together(tmp_path: Path):
     build_docx([page],path)
     doc=Document(path)
     assert not any("Источник:" in p.text for p in doc.paragraphs)
-    assert doc.tables[0].rows[0]._tr.trPr.find(qn('w:tblHeader')) is not None
+    assert doc.tables[0].rows[0]._tr.trPr.find(qn('w:tblHeader')) is None
     assert doc.tables[0].rows[1]._tr.trPr.find(qn('w:cantSplit')) is not None
     assert doc.tables[0].cell(1,2).text=="C₄H₈N₈O₈"
     assert doc.paragraphs[0].paragraph_format.keep_with_next

@@ -141,13 +141,30 @@ def review_items(pages) -> list[dict]:
     return out
 
 
-def review_report(pages) -> dict:
+def review_report(pages, *, source_inventory=None) -> dict:
     """Describe unresolved output without rewriting it or supplying replacements."""
     items=review_items(pages)
     unreadable=sum('[не распознано]' in item['text'] for item in items)
-    return dict(schema_version=1,result_policy='automatic_only',
+    report = dict(schema_version=1,result_policy='automatic_only',
                 complete_transcription_verified=False,
                 summary=dict(flagged_fragments=len(items),unreadable_fragments=unreadable),items=items)
+    if source_inventory is not None:
+        from npa_ocr.ocr import TableBlock
+        from npa_ocr.source_layout import source_review
+        coverage = []
+        table_pages = set()
+        for page in pages:
+            for block in page.blocks:
+                if isinstance(block, TableBlock):
+                    table_pages.update(block.source_pages or [page.page_number])
+        for page in pages:
+            source = source_inventory.get(page.page_number, {})
+            coverage.extend(source_review(page.page_number, source,
+                text_only=not page.ocr_applied and not page.blocks,
+                output_tables=int(page.page_number in table_pages)))
+        report.update(schema_version=2, source_inventory=source_inventory,
+                      coverage_issues=coverage)
+    return report
 
 
 def recover_table_closers(image, tables, text_blocks):

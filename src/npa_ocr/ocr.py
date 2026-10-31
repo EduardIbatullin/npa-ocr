@@ -1815,7 +1815,7 @@ def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DP
         # Keep it only in diagnostic exports and for untouched text layers.
         if i > 0 and not page.continues_table and (diagnostic or not page.ocr_applied):
             doc.add_page_break()
-        if not page.ocr_applied:
+        if not page.ocr_applied and not page.blocks:
             doc.add_paragraph(page.plain_text or "")
             continue
         run: list[TextBlock] = []
@@ -2361,6 +2361,7 @@ def ocr_document(
             pages_dir = out_docx_path.with_name(out_docx_path.stem + ".pages")
         pages_dir = Path(pages_dir)
         meta = {
+            "native_layout_version": 1,
             "dpi": dpi,
             "confidence_threshold": confidence_threshold,
             "min_page_text_chars": min_page_text_chars,
@@ -2392,9 +2393,12 @@ def ocr_document(
     marks_ask_fn = marks_ask_fn or vlm_marks.qwen_locate
     marks_down: str | None = None  # удаление меток: причина, по которой Ollama недоступна
     page_ds: dict[int, str] = {}  # ответ DeepSeek на страницу — для меток и второго прочтения
+    source_inventory = {}
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i, (pdf_page, fitz_page) in enumerate(zip(reader.pages, fitz_doc)):
             page_number = i + 1
+            from npa_ocr.source_layout import inspect_source
+            source_inventory[page_number] = inspect_source(fitz_page)
             page_file = pages_dir / f"page_{page_number:04d}.json"
             if resume:
                 with timer.step(page_number, "проверка сохранённого результата"):
@@ -2405,13 +2409,22 @@ def ocr_document(
                     continue
             with timer.step(page_number, "проверка текстового слоя"):
                 text = (pdf_page.extract_text() or "").strip()
+            mixed_native = None
             if len(text) >= min_page_text_chars:
-                page = PageResult(page_number=page_number, ocr_applied=False, plain_text=text)
-                with timer.step(page_number, "сохранение страницы"):
-                    _save_page(page_file, page, meta)
-                pages.append(page)
-                report(page_number, total, page_number, "текстовый слой")
-                continue
+                from npa_ocr.source_layout import extract_native_blocks
+                source = source_inventory[page_number]
+                native_blocks = extract_native_blocks(fitz_page, source, dpi)
+                if native_blocks is not None:
+                    page = PageResult(page_number=page_number, ocr_applied=False,
+                                      plain_text=text,
+                                      blocks=native_blocks if source['tables'] else [],
+                                      page_height=fitz_page.rect.height * dpi / 72)
+                    with timer.step(page_number, "сохранение страницы"):
+                        _save_page(page_file, page, meta)
+                    pages.append(page)
+                    report(page_number, total, page_number, "текстовый слой")
+                    continue
+                mixed_native = extract_native_blocks(fitz_page, source, dpi, allow_raster=True)
             report(i, total, page_number, "распознаётся")
             with timer.step(page_number, "проверка свободной памяти"):
                 ensure_free_memory(min_free_memory_mb, f"перед страницей {page_number}")
@@ -2434,6 +2447,7 @@ def ocr_document(
                 pix = fitz_page.get_pixmap(dpi=dpi)
                 pix.save(str(image_path))
             page_height = float(pix.height)
+            rotation = 0
             if auto_rotate:
                 with timer.step(page_number, "поворот страницы (OSD)"):
                     rotation = orientation_fn(image_path)
@@ -2563,6 +2577,10 @@ def ocr_document(
                     detect_marks_fn=_default_detect_marks_fn if use_ai_escalation else None,
                     recover_covered_text_fn=ai_escalation.recover_covered_text if use_ai_escalation else None,
                 )
+            if mixed_native is not None and not rotation:
+                from npa_ocr.source_layout import merge_mixed_blocks
+                blocks = merge_mixed_blocks(mixed_native, blocks,
+                                            source_inventory[page_number], dpi)
             page = PageResult(
                 page_number=page_number,
                 ocr_applied=True,
@@ -2593,7 +2611,8 @@ def ocr_document(
         build_docx(pages, out_docx_path, dpi=dpi, diagnostic=diagnostic)
         from npa_ocr.coverage import review_report
         out_docx_path.with_suffix(".review.json").write_text(
-            json.dumps(review_report(pages), ensure_ascii=False, indent=2), encoding="utf-8")
+            json.dumps(review_report(pages, source_inventory=source_inventory),
+                       ensure_ascii=False, indent=2), encoding="utf-8")
 
     timings = timer.report()
     timings_path = out_docx_path.with_name(out_docx_path.stem + ".timings.json")

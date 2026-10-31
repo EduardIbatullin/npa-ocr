@@ -39,8 +39,9 @@ def format_table(table, block) -> None:
     n_header = header_rows(block)
     for ri, row in enumerate(table.rows):
         props = row._tr.get_or_add_trPr()
-        if ri < n_header:
-            flag(props, "w:tblHeader")
+        # Keep the source heading once, including tables spanning DOCX pages.
+        for repeated in list(props.findall(qn("w:tblHeader"))):
+            props.remove(repeated)
         starting = [c for c in block.cells if c.row == ri]
         # No blanket cantSplit for a note spanning half a page or a tall group.
         if ri < n_header or (starting and all(len(c.text) <= 180 and c.row_span == 1 for c in starting)):
