@@ -137,6 +137,7 @@ class PageResult:
     # первая таблица страницы дописана в таблицу предыдущей (stitch_tables): в DOCX перед ней
     # нет разрыва страницы, иначе многостраничная таблица оставила бы пустые страницы
     continues_table: bool = False
+    review_issues: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -1661,6 +1662,7 @@ def remove_running_headers_and_footers(pages: list[PageResult]) -> list[PageResu
             blocks=kept,
             plain_text=page.plain_text,
             page_height=page.page_height,
+            review_issues=page.review_issues,
         ))
     return result
 
@@ -2156,6 +2158,7 @@ def _save_page(path: Path, page: PageResult, meta: dict) -> None:
         "ocr_applied": page.ocr_applied,
         "plain_text": page.plain_text,
         "page_height": page.page_height,
+        "review_issues": page.review_issues,
         "blocks": [_block_to_dict(b) for b in page.blocks],
     }
     part = path.with_name(path.name + ".part")
@@ -2184,6 +2187,7 @@ def _load_page(path: Path, meta: dict) -> PageResult | None:
         blocks=[_block_from_dict(b) for b in data["blocks"]],
         plain_text=data["plain_text"],
         page_height=data["page_height"],
+        review_issues=data.get("review_issues", []),
     )
 
 
@@ -2372,7 +2376,7 @@ def ocr_document(
         }
         if table_engine == "vlm":
             # версия пути vlm: при её смене сохранённые страницы распознаются заново
-            meta["vlm_version"] = 11
+            meta["vlm_version"] = 12
             if use_ai_escalation:
                 # удаление меток (vlm_marks) вместо ИИ-эскалации
                 meta["marks_version"] = 1
@@ -2397,6 +2401,7 @@ def ocr_document(
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i, (pdf_page, fitz_page) in enumerate(zip(reader.pages, fitz_doc)):
             page_number = i + 1
+            generation_issues = []
             from npa_ocr.source_layout import inspect_source
             source_inventory[page_number] = inspect_source(fitz_page)
             page_file = pages_dir / f"page_{page_number:04d}.json"
@@ -2494,6 +2499,10 @@ def ocr_document(
                         def chat(img: Image.Image) -> str:
                             """Запрос к DeepSeek-OCR; ответ сохраняется для меток и второго прочтения."""
                             raw = vlm_chat_fn(img)
+                            if getattr(raw, 'finish_reason', '') == 'length':
+                                generation_issues.append(dict(
+                                    reason='generation_truncated',
+                                    image_size=list(img.size), usage=raw.usage))
                             # Повторный запрос по кропу таблицы имеет другую систему
                             # координат: второе чтение текста использует только страницу.
                             page_ds.setdefault(_page, raw)
@@ -2586,6 +2595,7 @@ def ocr_document(
                 ocr_applied=True,
                 blocks=blocks,
                 page_height=page_height,
+                review_issues=generation_issues,
             )
             # страница с таблицами из запасного TATR сохраняется с другими параметрами, чтобы
             # следующий прогон распознал её через vLLM заново

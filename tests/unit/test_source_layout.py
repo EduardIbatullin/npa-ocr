@@ -153,3 +153,32 @@ def test_stitched_table_accounts_for_all_its_source_pages():
     report = review_report([PageResult(1, True, blocks=[table]), PageResult(2, True)],
                            source_inventory={1: source, 2: source})
     assert report['coverage_issues'] == []
+
+
+def test_truncated_generation_survives_cache_and_footer_filter(tmp_path):
+    from npa_ocr.ocr import _save_page, _load_page, remove_running_headers_and_footers
+    issue = dict(reason='generation_truncated', image_size=[400, 500],
+                 usage=dict(completion_tokens=6144))
+    page = PageResult(1, True, blocks=[TextBlock(100, 'Partial output')],
+                      page_height=500, review_issues=[issue])
+    path = tmp_path/'page.json'
+    _save_page(path, page, {})
+    restored = _load_page(path, {})
+    pages = remove_running_headers_and_footers([restored])
+    report = review_report(pages, source_inventory={})
+    assert report['coverage_issues'] == [dict(issue, page=1)]
+
+
+def test_vlm_text_retains_finish_reason_and_usage(monkeypatch):
+    import io
+    import json
+    from PIL import Image
+    from npa_ocr import vlm_tables
+    response = dict(choices=[dict(message=dict(content='Partial OCR'), finish_reason='length')],
+                    usage=dict(completion_tokens=6144))
+    monkeypatch.setattr(vlm_tables.urllib.request, 'urlopen',
+        lambda *args, **kwargs: io.BytesIO(json.dumps(response).encode()))
+    result = vlm_tables.deepseek_chat(Image.new('RGB', (10, 10), 'white'))
+    assert result == 'Partial OCR'
+    assert result.finish_reason == 'length'
+    assert result.usage['completion_tokens'] == 6144

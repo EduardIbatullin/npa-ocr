@@ -76,6 +76,16 @@ class VlmUnavailable(RuntimeError):
     """vLLM или шлюз перед ним не ответил: не запущен, не хватило видеопамяти, таймаут."""
 
 
+class VlmResponse(str):
+    """Text-compatible response retaining generation status for coverage review."""
+
+    def __new__(cls, text, *, finish_reason='', usage=None):
+        result = super().__new__(cls, text)
+        result.finish_reason = finish_reason
+        result.usage = usage or {}
+        return result
+
+
 def deepseek_chat(image: Image.Image) -> str:
     """Распознаёт страницу DeepSeek-OCR в режиме блоков с координатами.
 
@@ -111,7 +121,10 @@ def deepseek_chat(image: Image.Image) -> str:
     try:
         with urllib.request.urlopen(req, timeout=VLLM_TIMEOUT) as resp:
             result = json.loads(resp.read())
-        return result["choices"][0]["message"].get("content") or ""
+        choice = result["choices"][0]
+        return VlmResponse(choice["message"].get("content") or "",
+                           finish_reason=choice.get("finish_reason") or '',
+                           usage=result.get('usage'))
     except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError, KeyError, IndexError) as exc:
         raise VlmUnavailable(f"vLLM ({VLLM_URL}) недоступен: {exc}") from exc
 

@@ -158,6 +158,7 @@ def review_report(pages, *, source_inventory=None) -> dict:
                 if isinstance(block, TableBlock):
                     table_pages.update(block.source_pages or [page.page_number])
         for page in pages:
+            coverage.extend(dict(issue, page=page.page_number) for issue in page.review_issues)
             source = source_inventory.get(page.page_number, {})
             coverage.extend(source_review(page.page_number, source,
                 text_only=not page.ocr_applied and not page.blocks,
