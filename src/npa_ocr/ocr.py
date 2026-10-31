@@ -2365,7 +2365,7 @@ def ocr_document(
             pages_dir = out_docx_path.with_name(out_docx_path.stem + ".pages")
         pages_dir = Path(pages_dir)
         meta = {
-            "native_layout_version": 1,
+            "native_layout_version": 2,
             "dpi": dpi,
             "confidence_threshold": confidence_threshold,
             "min_page_text_chars": min_page_text_chars,

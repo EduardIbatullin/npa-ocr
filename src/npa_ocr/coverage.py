@@ -148,7 +148,8 @@ def review_report(pages, *, source_inventory=None) -> dict:
     report = dict(schema_version=1,result_policy='automatic_only',
                 complete_transcription_verified=False,
                 summary=dict(flagged_fragments=len(items),unreadable_fragments=unreadable),items=items)
-    if source_inventory is not None:
+    if source_inventory is not None or any(page.review_issues for page in pages):
+        source_inventory = source_inventory or {}
         from npa_ocr.ocr import TableBlock
         from npa_ocr.source_layout import source_review
         coverage = []

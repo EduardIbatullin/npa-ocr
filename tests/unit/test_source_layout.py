@@ -24,6 +24,7 @@ def test_native_table_keeps_cell_addresses_and_outside_text():
         (0, 0): 'Name', (0, 1): 'Value', (1, 0): 'Nitrogen', (1, 1): '1.51%'}
     assert [b.text for b in blocks if not isinstance(b, TableBlock)] == ['Heading']
     assert table.bbox == (80, 200, 680, 400)
+    assert table.source_pages == [1]
     doc.close()
 
 
@@ -182,3 +183,48 @@ def test_vlm_text_retains_finish_reason_and_usage(monkeypatch):
     assert result == 'Partial OCR'
     assert result.finish_reason == 'length'
     assert result.usage['completion_tokens'] == 6144
+
+
+def test_rotated_native_grid_does_not_mix_display_and_text_coordinates():
+    from npa_ocr.source_layout import source_review
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=500)
+    for y in (100, 150, 200):
+        page.draw_line((40, y), (340, y))
+    for x in (40, 190, 340):
+        page.draw_line((x, 100), (x, 200))
+    page.insert_text((50, 125), 'Name')
+    page.insert_text((200, 175), '1.51%')
+    page.set_rotation(90)
+    source = inspect_source(page)
+    assert source['tables']
+    assert extract_native_blocks(page, source, 72) is None
+    issues=source_review(1,source,text_only=False,output_tables=1)
+    assert any(i['reason']=='rotated_native_layout_unverified' for i in issues)
+    doc.close()
+
+
+def test_raster_inventory_matches_display_coordinates_of_rotated_pdf():
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=500)
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 100, 100), False)
+    pix.clear_with(200)
+    page.insert_image(fitz.Rect(30, 60, 370, 470), pixmap=pix, keep_proportion=False)
+    page.set_rotation(90)
+    source = inspect_source(page)
+    assert source['images'][0]['bbox'] == [30, 30, 440, 370]
+    doc.close()
+
+
+def test_native_finder_restores_callers_quad_correction_setting():
+    toggle=fitz.TOOLS.unset_quad_corrections
+    previous=toggle()
+    doc=fitz.open()
+    try:
+        page=doc.new_page()
+        toggle(True)
+        inspect_source(page)
+        assert toggle() is True
+    finally:
+        toggle(previous)
+        doc.close()

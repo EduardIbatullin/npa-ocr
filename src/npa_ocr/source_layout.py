@@ -5,6 +5,32 @@ Coordinates in the inventory are PDF points, never OCR image pixels.
 from __future__ import annotations
 
 
+def _ruled_tables(page):
+    """Use the line finder consistently across PyMuPDF 1.x and 2.x.
+
+    PyMuPDF 2.0 enables a layout hook and disables quad corrections on import.
+    The former can add empty columns; the latter separates decimal points.
+    See upstream issue https://github.com/pymupdf/PyMuPDF/issues/5198.
+    Restore the caller's global setting after the finder captures characters.
+    """
+    import inspect
+    import pymupdf as fitz
+    import pymupdf.table as table_api
+
+    options = dict(strategy='lines_strict')
+    if 'use_layout' in inspect.signature(table_api.find_tables).parameters:
+        options['use_layout'] = False
+    toggle = getattr(fitz.TOOLS, 'unset_quad_corrections', None)
+    previous = toggle() if toggle else None
+    try:
+        if toggle:
+            toggle(False)
+        return page.find_tables(**options)
+    finally:
+        if toggle:
+            toggle(previous)
+
+
 def inspect_source(page) -> dict:
     """Inventory visible raster regions and ruled tables, excluding page frames."""
     import pymupdf as fitz
@@ -12,7 +38,7 @@ def inspect_source(page) -> dict:
 
     area = max(page.rect.get_area(), 1)
     tables = []
-    for table in page.find_tables(strategy="lines_strict").tables:
+    for table in _ruled_tables(page).tables:
         rect = fitz.Rect(table.bbox)
         cells = [fitz.Rect(c) for c in table.cells if c is not None]
         # Drawing borders with a small title block surround the whole text body.
@@ -25,7 +51,7 @@ def inspect_source(page) -> dict:
                                cols=table.col_count))
     images = []
     for info in page.get_image_info():
-        rect = fitz.Rect(info["bbox"]) & page.rect
+        rect = (fitz.Rect(info["bbox"]) * page.rotation_matrix) & page.rect
         if rect.is_empty or rect.get_area() < .015 * area:
             continue
         images.append(dict(bbox=list(rect), area_ratio=rect.get_area() / area))
@@ -33,10 +59,10 @@ def inspect_source(page) -> dict:
     # outside recognized tables must not silently disappear from the review.
     outside_paths = 0
     for drawing in page.get_drawings():
-        rect = fitz.Rect(drawing['rect'])
+        rect = fitz.Rect(drawing['rect']) * page.rotation_matrix
         if not any(fitz.Rect(t['bbox']).contains(rect) for t in tables):
             outside_paths += 1
-    return dict(width=page.rect.width, height=page.rect.height,
+    return dict(width=page.rect.width, height=page.rect.height, rotation=page.rotation,
                 tables=tables, images=images, vector_paths_outside_tables=outside_paths,
                 native_characters=dict(Counter(c for c in page.get_text() if not c.isspace())))
 
@@ -56,6 +82,9 @@ def source_review(page_number: int, source: dict, *, text_only: bool,
     if source.get('vector_paths_outside_tables', 0) >= 20:
         issues.append(dict(page=page_number, reason='vector_content_preservation_unverified',
                            path_count=source['vector_paths_outside_tables']))
+    if source.get('rotation') and source.get('tables'):
+        issues.append(dict(page=page_number, reason='rotated_native_layout_unverified',
+                           rotation=source['rotation']))
     return issues
 
 
@@ -69,13 +98,18 @@ def extract_native_blocks(page, source: dict, dpi: int, *, allow_raster=False):
     from npa_ocr.ocr import TableBlock, TextBlock
     from npa_ocr.ocr_table import TableCell
 
+    # find_tables uses displayed coordinates, whereas get_text uses unrotated
+    # coordinates. Mixing them duplicates text and can transpose the grid.
+    # Until explicit transforms are validated, route rotated layouts to OCR.
+    if page.rotation:
+        return None if (source['tables'] or source['images']) else []
     if not allow_raster and any(image["area_ratio"] >= .12 for image in source["images"]):
         return None
     scale = dpi / 72
     allowed = {tuple(t["bbox"]) for t in source["tables"]}
     tables = []
     occupied = []
-    for table in page.find_tables(strategy="lines_strict").tables:
+    for table in _ruled_tables(page).tables:
         if tuple(table.bbox) not in allowed:
             continue
         boxes = [fitz.Rect(c) for c in table.cells if c is not None]
@@ -100,7 +134,8 @@ def extract_native_blocks(page, source: dict, dpi: int, *, allow_raster=False):
             occupied.append(rect)
         bbox = tuple(v * scale for v in table.bbox)
         tables.append(TableBlock(bbox[1], bbox, cells, table.row_count, table.col_count,
-                                column_edges=[(x-xs[0])/(xs[-1]-xs[0]) for x in xs]))
+                                column_edges=[(x-xs[0])/(xs[-1]-xs[0]) for x in xs],
+                                source_pages=[page.number + 1]))
     blocks = list(tables)
     for block in page.get_text("dict")["blocks"]:
         for line in block.get("lines", []):
