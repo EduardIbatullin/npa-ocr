@@ -160,7 +160,8 @@ def extract_native_blocks(page, source: dict, dpi: int, *, allow_raster=False):
 def merge_mixed_blocks(native_blocks, ocr_blocks, source: dict, dpi: int):
     """Keep native content outside large raster inserts, OCR inside them.
 
-    The caller must use unrotated PDF image coordinates. Raster preservation
+    Native blocks and raster regions must share the OCR canvas coordinates.
+    Use rotate_mixed_layout after rotating the image. Raster preservation
     remains unverified: OCR text is not a replacement for diagrams or signatures.
     """
     import pymupdf as fitz
@@ -180,3 +181,28 @@ def merge_mixed_blocks(native_blocks, ocr_blocks, source: dict, dpi: int):
 
     return sorted([b for b in native_blocks if not inside(b)]
                   + [b for b in ocr_blocks if inside(b)], key=lambda b: b.y)
+
+
+def rotate_mixed_layout(blocks, source: dict, dpi: int, rotation: int, width, height):
+    """Map native blocks and raster regions into the rotated OCR canvas."""
+    from dataclasses import replace
+    from npa_ocr.ocr import TextBlock
+
+    def box(rect):
+        x0,y0,x1,y1=rect
+        if rotation==90:return (height-y1,x0,height-y0,x1)
+        if rotation==180:return (width-x1,height-y1,width-x0,height-y0)
+        if rotation==270:return (y0,width-x1,y1,width-x0)
+        return (x0,y0,x1,y1)
+    transformed=[]
+    for block in blocks:
+        if isinstance(block,TextBlock):
+            x0,y0,x1,y1=box((block.x0,block.y,block.x1,block.y+block.height))
+            transformed.append(replace(block,x0=x0,x1=x1,y=y0,height=y1-y0))
+        else:
+            rect=box(block.bbox)
+            transformed.append(replace(block,y=rect[1],bbox=rect))
+    scale=dpi/72
+    images=[dict(image,bbox=[v/scale for v in box([c*scale for c in image['bbox']])])
+            for image in source['images']]
+    return transformed,dict(source,images=images)

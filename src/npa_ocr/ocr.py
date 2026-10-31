@@ -138,6 +138,8 @@ class PageResult:
     # нет разрыва страницы, иначе многостраничная таблица оставила бы пустые страницы
     continues_table: bool = False
     review_issues: list[dict] = field(default_factory=list)
+    page_width: float = 0.0
+    raster_rotation: int = 0
 
 
 @dataclass
@@ -1274,6 +1276,7 @@ def run_vlm_table_blocks(
     ask_fn: "vlm_reread.AskFn | None" = None,
     timer: "StepTimer | None" = None,
     page: int | None = None,
+    review_issues: list[dict] | None = None,
 ) -> list[TableBlock]:
     """Распознаёт таблицы страницы через DeepSeek-OCR и сетку по линиям.
 
@@ -1317,6 +1320,17 @@ def run_vlm_table_blocks(
         image_path, chat_fn=timed_chat, reread_fn=timed_reread if ask_fn is not None else None
     )
     elapsed = time.perf_counter() - t0
+    if review_issues is not None:
+        for index, table in enumerate(tables):
+            _, _, model_columns = vlm_tables.html_cells(table.html)
+            if table.src == 'grid' and model_columns != table.n_cols:
+                review_issues.append(dict(reason='table_column_count_disagreement',
+                    table_index=index,bbox=list(table.bbox),
+                    model_columns=model_columns,grid_columns=table.n_cols))
+            if table.src == 'grid' and table.info.get('ds_lost', 0):
+                review_issues.append(dict(reason='model_cells_unplaced',table_index=index,
+                    bbox=list(table.bbox),unplaced_cells=table.info['ds_lost'],
+                    model_cells=table.info.get('ds_cells')))
     if timer is not None:
         timer.add(page, "таблицы: DeepSeek-OCR (vLLM)", chat_seconds[0])
         timer.add(page, "таблицы: сетка по линиям", elapsed - chat_seconds[0] - reread_seconds[0])
@@ -1663,6 +1677,8 @@ def remove_running_headers_and_footers(pages: list[PageResult]) -> list[PageResu
             plain_text=page.plain_text,
             page_height=page.page_height,
             review_issues=page.review_issues,
+            page_width=page.page_width,
+            raster_rotation=page.raster_rotation,
         ))
     return result
 
@@ -1791,6 +1807,7 @@ def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DP
     """
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_COLOR_INDEX
+    from docx.enum.section import WD_ORIENT, WD_SECTION_START
     from docx.shared import Pt, Cm
 
     doc = Document()
@@ -1813,9 +1830,20 @@ def build_docx(pages: list[PageResult], out_path: Path, *, dpi: int = DEFAULT_DP
             "Жёлтым выделен неуверенно распознанный или восстановленный текст: проверьте его по скану."
         )
     for i, page in enumerate(pages):
+        section_changed = False
+        if page.page_width > 0 and page.page_height > 0 and (page.blocks or page.plain_text):
+            landscape = page.page_width > page.page_height
+            if landscape != (section.page_width > section.page_height):
+                if i > 0:
+                    section = doc.add_section(WD_SECTION_START.NEW_PAGE)
+                    section_changed = True
+                section.orientation = WD_ORIENT.LANDSCAPE if landscape else WD_ORIENT.PORTRAIT
+                section.page_width, section.page_height = (
+                    (Cm(29.7), Cm(21)) if landscape else (Cm(21), Cm(29.7)))
         # A source page boundary is not a layout boundary after reflow.
         # Keep it only in diagnostic exports and for untouched text layers.
-        if i > 0 and not page.continues_table and (diagnostic or not page.ocr_applied):
+        if (i > 0 and not section_changed and not page.continues_table
+                and (diagnostic or not page.ocr_applied)):
             doc.add_page_break()
         if not page.ocr_applied and not page.blocks:
             doc.add_paragraph(page.plain_text or "")
@@ -2057,7 +2085,12 @@ def _default_orientation_fn(image_path: Path) -> int:
     try:
         with Image.open(image_path) as img:
             img.load()
-            return parse_osd_rotation(pytesseract.image_to_osd(img))
+            from npa_ocr.orientation import check_osd_proposal, dominant_table_box
+            proposed = parse_osd_rotation(pytesseract.image_to_osd(img))
+            return check_osd_proposal(img, proposed, lambda sample:
+                pytesseract.image_to_data(sample, lang='rus+eng', config='--psm 11',
+                                          output_type=pytesseract.Output.DICT),
+                                      table_box=dominant_table_box(img))
     except (pytesseract.TesseractError, pytesseract.TesseractNotFoundError):
         return 0
 
@@ -2159,6 +2192,8 @@ def _save_page(path: Path, page: PageResult, meta: dict) -> None:
         "plain_text": page.plain_text,
         "page_height": page.page_height,
         "review_issues": page.review_issues,
+        "page_width": page.page_width,
+        "raster_rotation": page.raster_rotation,
         "blocks": [_block_to_dict(b) for b in page.blocks],
     }
     part = path.with_name(path.name + ".part")
@@ -2188,6 +2223,8 @@ def _load_page(path: Path, meta: dict) -> PageResult | None:
         plain_text=data["plain_text"],
         page_height=data["page_height"],
         review_issues=data.get("review_issues", []),
+        page_width=data.get("page_width", 0.0),
+        raster_rotation=data.get("raster_rotation", 0),
     )
 
 
@@ -2366,6 +2403,7 @@ def ocr_document(
         pages_dir = Path(pages_dir)
         meta = {
             "native_layout_version": 2,
+            "orientation_version": 1,
             "dpi": dpi,
             "confidence_threshold": confidence_threshold,
             "min_page_text_chars": min_page_text_chars,
@@ -2401,7 +2439,7 @@ def ocr_document(
     with tempfile.TemporaryDirectory() as tmp_dir:
         for i, (pdf_page, fitz_page) in enumerate(zip(reader.pages, fitz_doc)):
             page_number = i + 1
-            generation_issues = []
+            page_issues = []
             from npa_ocr.source_layout import inspect_source
             source_inventory[page_number] = inspect_source(fitz_page)
             page_file = pages_dir / f"page_{page_number:04d}.json"
@@ -2423,6 +2461,7 @@ def ocr_document(
                     page = PageResult(page_number=page_number, ocr_applied=False,
                                       plain_text=text,
                                       blocks=native_blocks if source['tables'] else [],
+                                      page_width=fitz_page.rect.width * dpi / 72,
                                       page_height=fitz_page.rect.height * dpi / 72)
                     with timer.step(page_number, "сохранение страницы"):
                         _save_page(page_file, page, meta)
@@ -2452,12 +2491,16 @@ def ocr_document(
                 pix = fitz_page.get_pixmap(dpi=dpi)
                 pix.save(str(image_path))
             page_height = float(pix.height)
+            page_width = float(pix.width)
+            render_width, render_height = page_width, page_height
             rotation = 0
             if auto_rotate:
                 with timer.step(page_number, "поворот страницы (OSD)"):
                     rotation = orientation_fn(image_path)
+                    if getattr(rotation, 'review_issue', None):
+                        page_issues.append(rotation.review_issue)
                     if rotation:
-                        page_height = float(rotate_page_image(image_path, rotation)[1])
+                        page_width, page_height = map(float, rotate_page_image(image_path, rotation))
             timed_image_data = _timed_fn(timer, page_number, "текст: Tesseract", image_data_fn)
 
             def tatr_tables_fn(path: Path, _page: int = page_number) -> list[TableBlock]:
@@ -2500,7 +2543,7 @@ def ocr_document(
                             """Запрос к DeepSeek-OCR; ответ сохраняется для меток и второго прочтения."""
                             raw = vlm_chat_fn(img)
                             if getattr(raw, 'finish_reason', '') == 'length':
-                                generation_issues.append(dict(
+                                page_issues.append(dict(
                                     reason='generation_truncated',
                                     image_size=list(img.size), usage=raw.usage))
                             # Повторный запрос по кропу таблицы имеет другую систему
@@ -2508,7 +2551,8 @@ def ocr_document(
                             page_ds.setdefault(_page, raw)
                             return raw
 
-                        return run_vlm_table_blocks(path, chat, ask_fn=vlm_ask_fn, timer=timer, page=_page)
+                        return run_vlm_table_blocks(path, chat, ask_fn=vlm_ask_fn, timer=timer,
+                                                    page=_page, review_issues=page_issues)
                     except vlm_tables.VlmUnavailable as exc:
                         vlm_down = str(exc)
                         print(f"{exc} — таблицы через TATR до конца документа", file=sys.stderr, flush=True)
@@ -2586,16 +2630,21 @@ def ocr_document(
                     detect_marks_fn=_default_detect_marks_fn if use_ai_escalation else None,
                     recover_covered_text_fn=ai_escalation.recover_covered_text if use_ai_escalation else None,
                 )
-            if mixed_native is not None and not rotation:
-                from npa_ocr.source_layout import merge_mixed_blocks
-                blocks = merge_mixed_blocks(mixed_native, blocks,
-                                            source_inventory[page_number], dpi)
+            if mixed_native is not None:
+                from npa_ocr.source_layout import merge_mixed_blocks, rotate_mixed_layout
+                merge_source = source_inventory[page_number]
+                if rotation:
+                    mixed_native, merge_source = rotate_mixed_layout(
+                        mixed_native, merge_source, dpi, int(rotation), render_width, render_height)
+                blocks = merge_mixed_blocks(mixed_native, blocks, merge_source, dpi)
             page = PageResult(
                 page_number=page_number,
                 ocr_applied=True,
                 blocks=blocks,
                 page_height=page_height,
-                review_issues=generation_issues,
+                review_issues=page_issues,
+                page_width=page_width,
+                raster_rotation=int(rotation),
             )
             # страница с таблицами из запасного TATR сохраняется с другими параметрами, чтобы
             # следующий прогон распознал её через vLLM заново

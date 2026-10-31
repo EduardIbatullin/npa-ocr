@@ -228,3 +228,38 @@ def test_native_finder_restores_callers_quad_correction_setting():
     finally:
         toggle(previous)
         doc.close()
+
+
+def test_rotated_mixed_page_preserves_native_heading_without_duplicate_ocr():
+    from npa_ocr.source_layout import rotate_mixed_layout, merge_mixed_blocks
+    heading=TextBlock(20,'Exact native heading',20,380,12)
+    hidden=TextBlock(120,'Hidden text over raster',30,300,12)
+    source=dict(images=[dict(bbox=[20,100,380,480],area_ratio=.68)])
+    native,rotated_source=rotate_mixed_layout([heading,hidden],source,72,90,400,500)
+    body=TextBlock(50,'Raster body',30,300,12)
+    false_heading=TextBlock(100,'Bad OCR heading',468,480,12)
+    result=merge_mixed_blocks(native,[body,false_heading],rotated_source,72)
+    assert [b.text for b in result]==['Exact native heading','Raster body']
+    assert source['images'][0]['bbox']==[20,100,380,480]
+
+
+def test_model_grid_disagreement_is_reported_without_changing_data(monkeypatch,tmp_path):
+    from npa_ocr import ocr,vlm_tables
+    from npa_ocr.ocr_table import TableCell
+    table=vlm_tables.VlmTable([0,0,200,100],[TableCell(0,0,1,2,'Data')],1,2,'grid',
+        '<table><tr><td>Data</td></tr></table>',
+        dict(xe=[0,100,200],ye=[0,100],ds_lost=1,ds_cells=3))
+    monkeypatch.setattr(vlm_tables,'run_vlm_tables',lambda *args,**kwargs:[table])
+    issues=[]
+    blocks=ocr.run_vlm_table_blocks(tmp_path/'page.png',lambda image:'',review_issues=issues)
+    assert blocks[0].n_cols==2 and blocks[0].cells[0].text=='Data'
+    assert issues[0]['reason']=='table_column_count_disagreement'
+    assert (issues[0]['model_columns'],issues[0]['grid_columns'])==(1,2)
+    assert issues[1]['reason']=='model_cells_unplaced'
+    report=review_report([PageResult(1,True,review_issues=issues)],source_inventory={})
+    assert report['summary']['coverage_issues']==2
+    # An abandoned grid must not produce a loss warning for an HTML fallback.
+    table.src='deepseek'
+    issues=[]
+    ocr.run_vlm_table_blocks(tmp_path/'page.png',lambda image:'',review_issues=issues)
+    assert issues==[]

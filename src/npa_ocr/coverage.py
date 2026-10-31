@@ -176,7 +176,10 @@ def review_report(pages, *, source_inventory=None) -> dict:
                         reason='native_text_character_mismatch',
                         missing_characters=dict(missing), extra_characters=dict(extra)))
         report.update(schema_version=2, source_inventory=source_inventory,
-                      coverage_issues=coverage)
+                      coverage_issues=coverage,
+                      page_geometry=[dict(page=p.page_number,width=p.page_width,
+                          height=p.page_height,raster_rotation=p.raster_rotation) for p in pages])
+        report['summary']['coverage_issues'] = len(coverage)
     return report
 
 
