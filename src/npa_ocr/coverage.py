@@ -162,6 +162,17 @@ def review_report(pages, *, source_inventory=None) -> dict:
             coverage.extend(source_review(page.page_number, source,
                 text_only=not page.ocr_applied and not page.blocks,
                 output_tables=int(page.page_number in table_pages)))
+            if not page.ocr_applied and page.blocks and 'native_characters' in source:
+                from collections import Counter
+                text = ''.join(''.join(c.text for c in b.cells) if isinstance(b, TableBlock)
+                               else getattr(b, 'text', '') for b in page.blocks)
+                actual = Counter(c for c in text if not c.isspace())
+                expected = Counter(source['native_characters'])
+                missing, extra = expected-actual, actual-expected
+                if missing or extra:
+                    coverage.append(dict(page=page.page_number,
+                        reason='native_text_character_mismatch',
+                        missing_characters=dict(missing), extra_characters=dict(extra)))
         report.update(schema_version=2, source_inventory=source_inventory,
                       coverage_issues=coverage)
     return report

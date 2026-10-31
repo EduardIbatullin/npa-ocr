@@ -118,3 +118,38 @@ def test_page_frame_is_not_exported_as_a_table():
     page.insert_text((30, 460), 'Title block')
     assert inspect_source(page)['tables'] == []
     doc.close()
+
+
+def test_tight_rows_do_not_duplicate_neighbouring_values():
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=400)
+    for y in (100, 112, 124):
+        page.draw_line((20, y), (280, y))
+    for x in (20, 150, 280):
+        page.draw_line((x, 100), (x, 124))
+    for x, y, text in ((30, 111, 'Carbon'), (160, 111, '57.8'),
+                        (30, 123, 'Hydrogen'), (160, 123, '2.8')):
+        page.insert_text((x, y), text, fontsize=11)
+    blocks = extract_native_blocks(page, inspect_source(page), 72)
+    table, = [b for b in blocks if isinstance(b, TableBlock)]
+    assert {(c.row, c.col): c.text for c in table.cells} == {
+        (0, 0): 'Carbon', (0, 1): '57.8', (1, 0): 'Hydrogen', (1, 1): '2.8'}
+    doc.close()
+
+
+def test_native_character_loss_is_reported_without_inventing_replacement():
+    source = dict(images=[], tables=[], native_characters={'A': 1, '4': 1})
+    report = review_report([PageResult(1, False, blocks=[TextBlock(10, 'A')])],
+                           source_inventory={1: source})
+    issue, = report['coverage_issues']
+    assert issue['reason'] == 'native_text_character_mismatch'
+    assert issue['missing_characters'] == {'4': 1}
+    assert 'replacement' not in issue
+
+
+def test_stitched_table_accounts_for_all_its_source_pages():
+    table = TableBlock(10, (0, 10, 100, 100), [], 2, 2, source_pages=[1, 2])
+    source = dict(images=[], tables=[dict(bbox=[0, 0, 100, 100], rows=2, cols=2)])
+    report = review_report([PageResult(1, True, blocks=[table]), PageResult(2, True)],
+                           source_inventory={1: source, 2: source})
+    assert report['coverage_issues'] == []

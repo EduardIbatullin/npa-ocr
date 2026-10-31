@@ -8,6 +8,7 @@ from __future__ import annotations
 def inspect_source(page) -> dict:
     """Inventory visible raster regions and ruled tables, excluding page frames."""
     import pymupdf as fitz
+    from collections import Counter
 
     area = max(page.rect.get_area(), 1)
     tables = []
@@ -36,7 +37,8 @@ def inspect_source(page) -> dict:
         if not any(fitz.Rect(t['bbox']).contains(rect) for t in tables):
             outside_paths += 1
     return dict(width=page.rect.width, height=page.rect.height,
-                tables=tables, images=images, vector_paths_outside_tables=outside_paths)
+                tables=tables, images=images, vector_paths_outside_tables=outside_paths,
+                native_characters=dict(Counter(c for c in page.get_text() if not c.isspace())))
 
 
 def source_review(page_number: int, source: dict, *, text_only: bool,
@@ -84,12 +86,16 @@ def extract_native_blocks(page, source: dict, dpi: int, *, allow_raster=False):
         if len(xs) != table.col_count + 1 or len(ys) != table.row_count + 1:
             return None
         cells = []
+        contents = table.extract()
         for rect in boxes:
             col = min(range(len(xs)), key=lambda i: abs(xs[i] - rect.x0))
             row = min(range(len(ys)), key=lambda i: abs(ys[i] - rect.y0))
             right = min(range(len(xs)), key=lambda i: abs(xs[i] - rect.x1))
             bottom = min(range(len(ys)), key=lambda i: abs(ys[i] - rect.y1))
-            text = page.get_textbox(rect).strip()
+            # get_textbox includes characters merely intersecting the clip,
+            # which duplicates neighbouring rows in tightly ruled tables.
+            # Table.extract assigns characters to a cell by their centres.
+            text = (contents[row][col] or '').strip()
             cells.append(TableCell(row, col, bottom-row, right-col, text))
             occupied.append(rect)
         bbox = tuple(v * scale for v in table.bbox)
